@@ -1,14 +1,11 @@
 {
-  "name": "chat-app",
+  "name": "chathifi-backend",
   "version": "1.0.0",
   "description": "Premium Chat Application",
-  "main": "server/index.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node server/index.js",
-    "dev": "nodemon server/index.js",
-    "css": "tailwindcss -i ./src/input.css -o ./public/css/tailwind.css --minify",
-    "css:watch": "tailwindcss -i ./src/input.css -o ./public/css/tailwind.css --watch",
-    "build": "npm run css"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -19,9 +16,6 @@
     "uuid": "^9.0.0"
   },
   "devDependencies": {
-    "autoprefixer": "^10.4.20",
-    "nodemon": "^3.0.1",
-    "postcss": "^8.4.47",
-    "tailwindcss": "^3.4.14"
+    "nodemon": "^3.0.1"
   }
 }
