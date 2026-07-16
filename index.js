@@ -11,21 +11,22 @@ const cors = require('cors');
 const app = express();
 app.use(cors({
   origin: '*',
-  methods: ['GET', 'POST', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: '*',
-    methods: ['GET', 'POST']
+    methods: ['GET', 'POST', 'PUT', 'DELETE']
   }
 });
 
-const PORT = process.env.PORT || 8082;
+const PORT = process.env.PORT || 8083;
 const FEEDBACK_HUB_ID = 'feedback-global-hub';
-const DB_PATH = path.join(__dirname, 'db.json');
-const UPLOADS_PATH = path.join(__dirname, 'uploads');
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const DB_PATH = path.join(DATA_DIR, 'db.json');
+const UPLOADS_PATH = path.join(DATA_DIR, 'uploads');
 
 // Create uploads folder if not exists
 if (!fs.existsSync(UPLOADS_PATH)) {
@@ -812,6 +813,11 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Profile update (name/bio) sync
+  socket.on('update_profile', (data) => {
+    io.emit('user_profile_updated', { userId: data.userId, displayName: data.displayName, bio: data.bio });
+  });
+
   // Send DM
   socket.on('send_message', (data) => {
     const { from, to, text, type = 'text', mediaUrl = null, replyTo = null } = data;
@@ -1206,6 +1212,12 @@ io.on('connection', (socket) => {
 });
 
 ensureFeedbackHub();
+
+// Global error handler — return JSON instead of HTML (e.g. multer/file errors)
+app.use((err, req, res, next) => {
+  console.error('[UPLOAD/API ERROR]', err);
+  res.status(err.status || 500).json({ error: err.message || 'Upload failed' });
+});
 
 server.listen(PORT, () => {
   console.log(`🚀 Chat server running on http://localhost:${PORT}`);
