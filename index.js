@@ -1020,21 +1020,65 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('p2p_cancel', (data) => {
+  socket.on('p2p_complete', (data) => {
     const { to, transferId } = data;
-    if (!to) return;
-    const recipientSocket = onlineUsers.get(to);
-    if (recipientSocket) {
-      io.to(recipientSocket).emit('p2p_cancel', { from: socket.userId, transferId });
+    const db = loadDB();
+    const msg = db.messages.find(m => m.p2pId === transferId || (m.p2pMeta && m.p2pMeta.p2pId === transferId));
+    if (msg) {
+      msg.p2pStatus = 'completed';
+      saveDB(db);
+    }
+    if (to) {
+      const recipientSocket = onlineUsers.get(to);
+      if (recipientSocket) {
+        io.to(recipientSocket).emit('p2p_complete', { from: socket.userId, transferId });
+      }
     }
   });
 
-  socket.on('p2p_complete', (data) => {
+  socket.on('p2p_cancel', (data) => {
     const { to, transferId } = data;
-    if (!to) return;
-    const recipientSocket = onlineUsers.get(to);
-    if (recipientSocket) {
-      io.to(recipientSocket).emit('p2p_complete', { from: socket.userId, transferId });
+    const db = loadDB();
+    const msg = db.messages.find(m => m.p2pId === transferId || (m.p2pMeta && m.p2pMeta.p2pId === transferId));
+    if (msg) {
+      msg.p2pStatus = 'declined';
+      saveDB(db);
+    }
+    if (to) {
+      const recipientSocket = onlineUsers.get(to);
+      if (recipientSocket) {
+        io.to(recipientSocket).emit('p2p_cancel', { from: socket.userId, transferId });
+      }
+    }
+  });
+
+  socket.on('p2p_failed', (data) => {
+    const { to, transferId } = data;
+    const db = loadDB();
+    const msg = db.messages.find(m => m.p2pId === transferId || (m.p2pMeta && m.p2pMeta.p2pId === transferId));
+    if (msg) {
+      msg.p2pStatus = 'failed';
+      saveDB(db);
+    }
+    if (to) {
+      const recipientSocket = onlineUsers.get(to);
+      if (recipientSocket) {
+        io.to(recipientSocket).emit('p2p_failed', { from: socket.userId, transferId });
+      }
+    }
+  });
+
+  socket.on('p2p_update_status', (data) => {
+    const { transferId, msgId, status } = data;
+    if (!status) return;
+    const db = loadDB();
+    const msg = db.messages.find(m =>
+      (transferId && (m.p2pId === transferId || (m.p2pMeta && m.p2pMeta.p2pId === transferId))) ||
+      (msgId && m.id === msgId)
+    );
+    if (msg) {
+      msg.p2pStatus = status;
+      saveDB(db);
     }
   });
 
