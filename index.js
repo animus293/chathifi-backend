@@ -820,7 +820,7 @@ io.on('connection', (socket) => {
 
   // Send DM
   socket.on('send_message', (data) => {
-    const { from, to, text, type = 'text', mediaUrl = null, replyTo = null } = data;
+    const { from, to, text, type = 'text', mediaUrl = null, replyTo = null, p2pId = null, p2pMeta = null } = data;
     const db = loadDB();
 
     // Check if sender is blocked by the recipient
@@ -843,6 +843,8 @@ io.on('connection', (socket) => {
       type,
       mediaUrl,
       replyTo,
+      p2pId,
+      p2pMeta,
       reactions: {},
       readBy: [],
       deleted: false,
@@ -865,7 +867,7 @@ io.on('connection', (socket) => {
 
   // Send group message
   socket.on('send_group_message', (data) => {
-    const { from, groupId, text, type = 'text', mediaUrl = null, replyTo = null } = data;
+    const { from, groupId, text, type = 'text', mediaUrl = null, replyTo = null, p2pId = null, p2pMeta = null } = data;
     const db = loadDB();
 
     const group = db.groups.find(g => g.id === groupId);
@@ -880,6 +882,8 @@ io.on('connection', (socket) => {
       type,
       mediaUrl,
       replyTo,
+      p2pId,
+      p2pMeta,
       reactions: {},
       readBy: [],
       deleted: false,
@@ -996,6 +1000,41 @@ io.on('connection', (socket) => {
       msg.deleted = true;
       saveDB(db);
       io.emit('message_deleted', { messageId });
+    }
+  });
+
+  // ===== WEBRTC DIRECT P2P FILE SIGNALING =====
+  socket.on('p2p_signal', (data) => {
+    const { to, signal, transferId, fileMeta } = data;
+    if (!to) return;
+    const recipientSocket = onlineUsers.get(to);
+    if (recipientSocket) {
+      io.to(recipientSocket).emit('p2p_signal', {
+        from: socket.userId,
+        signal,
+        transferId,
+        fileMeta
+      });
+    } else {
+      socket.emit('p2p_error', { transferId, error: 'Recipient is offline for P2P transfer' });
+    }
+  });
+
+  socket.on('p2p_cancel', (data) => {
+    const { to, transferId } = data;
+    if (!to) return;
+    const recipientSocket = onlineUsers.get(to);
+    if (recipientSocket) {
+      io.to(recipientSocket).emit('p2p_cancel', { from: socket.userId, transferId });
+    }
+  });
+
+  socket.on('p2p_complete', (data) => {
+    const { to, transferId } = data;
+    if (!to) return;
+    const recipientSocket = onlineUsers.get(to);
+    if (recipientSocket) {
+      io.to(recipientSocket).emit('p2p_complete', { from: socket.userId, transferId });
     }
   });
 
