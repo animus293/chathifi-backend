@@ -8,7 +8,28 @@ const fs = require('fs');
 const multer = require('multer');
 const cors = require('cors');
 
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
+
 const app = express();
+
+// 1. Security Headers (accurate/secure)
+app.use(helmet());
+
+// 2. Compress responses (smooth/fast)
+app.use(compression());
+
+// 3. API Rate Limiting (secure/accurate)
+const limiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 200, // Limit each IP to 200 requests per windowMs
+  message: { error: 'Too many requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(limiter);
+
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -131,7 +152,7 @@ function saveDB(data) {
 }
 
 // Middleware
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, '..', 'public'), { maxAge: 0 }));
 app.use('/uploads', express.static(UPLOADS_PATH));
 
@@ -299,6 +320,15 @@ app.put('/api/users/:id/profile', (req, res) => {
     if (avatar !== undefined) user.avatar = avatar;
     saveDB(db);
     const { password, ...u } = user;
+    
+    // Real-time broadcast to all connected devices / users
+    if (avatar !== undefined) {
+      io.emit('user_avatar_updated', { userId: user.id, avatarUrl: user.avatar });
+    }
+    if (displayName !== undefined || bio !== undefined) {
+      io.emit('user_profile_updated', { userId: user.id, displayName: user.displayName, bio: user.bio, avatar: user.avatar });
+    }
+
     res.json({ success: true, user: u });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -360,12 +390,13 @@ app.post('/api/users/:userId/mute', (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (!user.mutedConversations) user.mutedConversations = [];
 
+    const cid = String(conversationId);
     if (action === 'mute') {
-      if (!user.mutedConversations.includes(conversationId)) {
-        user.mutedConversations.push(conversationId);
+      if (!user.mutedConversations.includes(cid)) {
+        user.mutedConversations.push(cid);
       }
     } else if (action === 'unmute') {
-      user.mutedConversations = user.mutedConversations.filter(id => id !== conversationId);
+      user.mutedConversations = user.mutedConversations.filter(id => String(id) !== cid);
     } else {
       return res.status(400).json({ error: 'Invalid action' });
     }
@@ -745,6 +776,103 @@ app.get('/api/feedback/messages', (req, res) => {
   }
 });
 
+// Poll new unread messages for background native service (0 dependencies, 100% private)
+app.get('/api/notifications/poll', (req, res) => {
+  try {
+    const { userId, since } = req.query;
+    if (!userId) return res.json({ unread: [] });
+    const db = loadDB();
+    const sinceDate = since ? new Date(Number(since)) : new Date(Date.now() - 30000);
+
+    const unread = db.messages.filter(m => {
+      if (m.deleted) return false;
+      if (m.read) return false;
+      if (m.readBy && Array.isArray(m.readBy) && m.readBy.includes(userId)) return false;
+      if (String(m.from) === String(userId)) return false;
+      if (new Date(m.timestamp) <= sinceDate) return false;
+
+      if (m.groupId) {
+        const group = db.groups.find(g => String(g.id) === String(m.groupId));
+        return group && group.members && group.members.some(memId => String(memId) === String(userId));
+      } else {
+        return String(m.to) === String(userId);
+      }
+    });
+
+    const userMap = {};
+    const avatarMap = {};
+    db.users.forEach(u => {
+      userMap[u.id] = u.displayName || u.username;
+      avatarMap[u.id] = u.avatar || null;
+    });
+
+    const formatted = unread.slice(0, 5).map(m => ({
+      id: m.id,
+      from: m.from,
+      groupId: m.groupId || null,
+      senderName: userMap[m.from] || 'Someone',
+      senderAvatar: avatarMap[m.from] || null,
+      text: m.text || (m.type === 'image' ? '📷 Photo' : m.type === 'voice' ? '🎤 Voice' : 'New message'),
+      timestamp: m.timestamp
+    }));
+
+    res.json({ unread: formatted });
+  } catch (e) {
+    res.json({ unread: [] });
+  }
+});
+
+// HTTP endpoint for Android status bar inline replies (0 dependencies)
+app.post('/api/messages/reply', (req, res) => {
+  try {
+    const { from, to, groupId, text, replyTo } = req.body;
+    if (!from || (!to && !groupId) || !text) return res.status(400).json({ error: 'Missing required parameters' });
+
+    const db = loadDB();
+    const message = {
+      id: uuidv4(),
+      from,
+      to: groupId ? null : to,
+      groupId: groupId || null,
+      text: text.trim(),
+      type: 'text',
+      replyTo: replyTo || null,
+      timestamp: new Date().toISOString(),
+      read: false,
+      readBy: [from]
+    };
+
+    db.messages.push(message);
+    saveDB(db);
+
+    if (groupId) {
+      const group = db.groups.find(g => String(g.id) === String(groupId));
+      if (group) {
+        group.members.forEach(memberId => {
+          if (String(memberId) === String(from)) return;
+          onlineUsers.forEach((sId, uId) => {
+            if (String(uId) === String(memberId)) io.to(sId).emit('new_group_message', message);
+          });
+        });
+      }
+    } else if (to) {
+      onlineUsers.forEach((sId, uId) => {
+        if (String(uId) === String(to)) {
+          io.to(sId).emit('new_message', message);
+        }
+        if (String(uId) === String(from)) {
+          io.to(sId).emit('message_sent', message);
+          io.to(sId).emit('new_message', message);
+        }
+      });
+    }
+
+    res.json({ success: true, message });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to send reply' });
+  }
+});
+
 // ============ MESSAGES ROUTES ============
 
 // Get messages (DM or group)
@@ -1079,6 +1207,18 @@ io.on('connection', (socket) => {
     if (msg) {
       msg.p2pStatus = status;
       saveDB(db);
+    }
+  });
+
+  socket.on('update_avatar', (data) => {
+    if (data && data.userId) {
+      io.emit('user_avatar_updated', { userId: data.userId, avatarUrl: data.avatarUrl });
+    }
+  });
+
+  socket.on('update_profile', (data) => {
+    if (data && data.userId) {
+      io.emit('user_profile_updated', data);
     }
   });
 
