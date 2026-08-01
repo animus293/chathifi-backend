@@ -28,6 +28,10 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 8083;
 const FEEDBACK_HUB_ID = 'feedback-global-hub';
+// Comma-separated usernames that are always treated as global admins,
+// regardless of DB state (e.g. ADMIN_USERNAMES=alice,bob). The first
+// registered account also becomes an admin so a fresh deploy is usable.
+const ADMIN_USERNAMES = (process.env.ADMIN_USERNAMES || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 const DB_PATH = path.join(DATA_DIR, 'db.json');
 const UPLOADS_PATH = path.join(DATA_DIR, 'uploads');
@@ -197,25 +201,47 @@ let dbCacheMtime = 0;
 
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) {
-    const initial = { users: [], groups: [], messages: [], sessions: [] };
-    fs.writeFileSync(DB_PATH, JSON.stringify(initial, null, 2));
+    const initial = { users: [], groups: [], messages: [], sessions: [], reports: [] };
+    fs.writeFileSync(DB_PATH, JSON.stringify(initial));
     dbCache = initial;
-    dbCacheMtime = Date.now();
+    dbCacheMtime = fs.statSync(DB_PATH).mtimeMs;
     return initial;
   }
   const stat = fs.statSync(DB_PATH);
   if (dbCache && stat.mtimeMs === dbCacheMtime) return dbCache;
   dbCache = JSON.parse(fs.readFileSync(DB_PATH, 'utf-8'));
-  // Normalize legacy databases (pre-auth) that lack a sessions array.
+  // Normalize legacy databases: missing collections + missing per-user fields.
   if (!Array.isArray(dbCache.sessions)) dbCache.sessions = [];
-  dbCacheMtime = stat.mtimeMs;
+  if (!Array.isArray(dbCache.reports)) dbCache.reports = [];
+  let changed = false;
+  (dbCache.users || []).forEach(u => {
+    if (u.role === undefined) { u.role = 'user'; changed = true; }
+    if (u.banned === undefined) { u.banned = false; changed = true; }
+    if (u.bannedAt === undefined) { u.bannedAt = null; changed = true; }
+  });
+  // Promote any env-configured admin usernames on every load (cheap, idempotent).
+  if (ADMIN_USERNAMES.length) {
+    (dbCache.users || []).forEach(u => {
+      if (ADMIN_USERNAMES.includes(String(u.username || '').toLowerCase()) && u.role !== 'admin') {
+        u.role = 'admin'; changed = true;
+      }
+    });
+  }
+  if (changed) saveDB(dbCache); // saveDB records the correct post-write mtime
+  else dbCacheMtime = stat.mtimeMs; // untouched file: cache the stat we just read
   return dbCache;
 }
 
 function saveDB(data) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
   dbCache = data;
-  dbCacheMtime = Date.now();
+  // Compact JSON (no pretty-print) keeps the on-disk file ~3x smaller, so the
+  // occasional cold read + every write is much faster on large databases.
+  fs.writeFileSync(DB_PATH, JSON.stringify(data));
+  // Record the FILE's mtime (float with sub-ms precision), not Date.now():
+  // comparing stat.mtimeMs to a Date.now() integer NEVER matched, which forced
+  // loadDB to re-read + re-parse the whole db.json on every single request
+  // (multi-second latency on the deployed backend).
+  dbCacheMtime = fs.statSync(DB_PATH).mtimeMs;
 }
 
 // ============ SESSION TOKENS ============
@@ -285,8 +311,27 @@ function requireAuth(req, res, next) {
     : (req.headers['x-auth-token'] || '');
   const session = getSessionByToken(token);
   if (!session) return res.status(401).json({ error: 'Unauthorized' });
+  const user = loadDB().users.find(u => u.id === session.userId);
+  if (!user) return res.status(401).json({ error: 'Unauthorized' });
+  // Banned users are locked out of every authenticated API (including the
+  // Android notification poll) until an admin unbans them.
+  if (user.banned) return res.status(403).json({ error: 'Account banned', banned: true });
   req.userId = session.userId;
+  req.user = user;
   next();
+}
+
+// Global admin gate — used on all /api/admin/* routes. Requires the opaque
+// session from requireAuth (req.user is the verified user record).
+function requireAdmin(req, res, next) {
+  if (!req.user || req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admins only' });
+  }
+  next();
+}
+
+function isAdminUser(user) {
+  return !!user && user.role === 'admin';
 }
 
 // Middleware
@@ -329,6 +374,9 @@ app.post('/api/signup', async (req, res) => {
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
+    // First registered account becomes the global admin (bootstraps a usable
+    // deploy); env-configured usernames are always promoted too.
+    const isFirstUser = db.users.length === 0;
     const newUser = {
       id: uuidv4(),
       username: username.toLowerCase(),
@@ -339,7 +387,10 @@ app.post('/api/signup', async (req, res) => {
       blockedUsers: [],
       online: false,
       lastSeen: new Date().toISOString(),
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      role: (isFirstUser || ADMIN_USERNAMES.includes(username.toLowerCase())) ? 'admin' : 'user',
+      banned: false,
+      bannedAt: null
     };
 
     db.users.push(newUser);
@@ -392,6 +443,17 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid username or password' });
     }
 
+    // Banned accounts cannot sign in at all.
+    if (user.banned) {
+      return res.status(403).json({ error: 'This account has been banned.', banned: true });
+    }
+
+    // Env-configured admins are promoted at login too (covers pre-existing DBs).
+    if (ADMIN_USERNAMES.includes(String(user.username || '').toLowerCase()) && user.role !== 'admin') {
+      user.role = 'admin';
+      saveDB(db);
+    }
+
     user.online = true;
     user.lastSeen = new Date().toISOString();
     saveDB(db);
@@ -438,19 +500,24 @@ app.get('/api/users/search', (req, res) => {
       );
     }
 
-    const results = users.map(({ password, ...u }) => u);
+    // Public listing — never expose moderation fields (role/banned) to regular
+    // users; the admin panel has its own admin-only endpoint for that.
+    const results = users.map(({ password, role, banned, bannedAt, ...u }) => u);
     res.json({ users: results });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Get user by ID
+// Get user by ID (own profile includes role/banned; other users see public data)
 app.get('/api/users/:id', (req, res) => {
   const db = loadDB();
   const user = db.users.find(u => u.id === req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
-  const { password, ...u } = user;
+  const isSelf = String(user.id) === String(req.userId);
+  const isAdmin = isAdminUser(req.user);
+  const { password, role, banned, bannedAt, ...rest } = user;
+  const u = (isSelf || isAdmin) ? { ...rest, role, banned, bannedAt } : rest;
   res.json({ user: u });
 });
 
@@ -1160,6 +1227,206 @@ app.get('/api/messages', (req, res) => {
   }
 });
 
+// ============ REPORTING & ADMIN MODERATION ============
+
+const REPORT_WINDOW_MS = 15 * 60 * 1000; // 15 min
+const REPORT_MAX = 15;                   // reports per user per window
+const REPORT_REASONS = ['spam', 'harassment', 'inappropriate', 'impersonation', 'other'];
+
+// Revoke every session a user holds (used when banning).
+function deleteAllSessionsForUser(userId) {
+  const db = loadDB();
+  if (!Array.isArray(db.sessions)) return;
+  const before = db.sessions.length;
+  db.sessions = db.sessions.filter(s => s.userId !== userId);
+  if (db.sessions.length !== before) saveDB(db);
+}
+
+// Report a message for moderation. Any authenticated user who is party to the
+// conversation may report (they cannot report their own message).
+app.post('/api/messages/:id/report', (req, res) => {
+  try {
+    const result = rateLimit(`report:${req.userId}`, { windowMs: REPORT_WINDOW_MS, max: REPORT_MAX });
+    if (!result.allowed) return sendTooMany(res, result.retryAfterMs, 'Reporting too fast — try again shortly.');
+
+    const { reason } = req.body;
+    const reasonOk = REPORT_REASONS.includes(reason);
+    if (!reasonOk) return res.status(400).json({ error: 'Invalid report reason' });
+
+    const db = loadDB();
+    const msg = db.messages.find(m => m.id === req.params.id);
+    if (!msg || msg.deleted) return res.status(404).json({ error: 'Message not found' });
+    if (String(msg.from) === String(req.userId)) {
+      return res.status(400).json({ error: 'You cannot report your own message' });
+    }
+    if (!isUserPartyToMessage(msg, req.userId)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    if (!Array.isArray(db.reports)) db.reports = [];
+    // Idempotent per user: don't stack duplicate open reports.
+    const existing = db.reports.find(r =>
+      r.messageId === msg.id && r.reporterId === req.userId && r.status === 'open');
+    if (existing) return res.json({ success: true, alreadyReported: true });
+
+    db.reports.push({
+      id: uuidv4(),
+      messageId: msg.id,
+      reporterId: req.userId,
+      reason,
+      status: 'open',
+      createdAt: new Date().toISOString(),
+      resolvedAt: null,
+      resolvedBy: null
+    });
+    saveDB(db);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- ADMIN: all routes below require the global admin role ----
+
+// List every user with moderation metadata (never the password).
+app.get('/api/admin/users', requireAdmin, (req, res) => {
+  try {
+    const db = loadDB();
+    const users = db.users.map(u => {
+      const { password, ...safe } = u;
+      safe.messageCount = db.messages.filter(m => m.from === u.id && !m.deleted).length;
+      safe.reportCount = (db.reports || []).filter(r => r.messageId && db.messages.some(m => m.id === r.messageId && m.from === u.id)).length;
+      return safe;
+    }).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    res.json({ users });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Ban a user: locks them out of login, every /api route, and live sockets.
+app.post('/api/admin/users/:id/ban', requireAdmin, (req, res) => {
+  try {
+    const db = loadDB();
+    const user = db.users.find(u => u.id === req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.id === req.userId) return res.status(400).json({ error: 'You cannot ban yourself' });
+    user.banned = true;
+    user.bannedAt = new Date().toISOString();
+    deleteAllSessionsForUser(user.id);
+    saveDB(db);
+    kickBannedUser(user.id, 'Your account has been banned by an admin.');
+    res.json({ success: true, user: { id: user.id, username: user.username, banned: true } });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Unban a user — restores login + API + socket access.
+app.post('/api/admin/users/:id/unban', requireAdmin, (req, res) => {
+  try {
+    const db = loadDB();
+    const user = db.users.find(u => u.id === req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    user.banned = false;
+    user.bannedAt = null;
+    saveDB(db);
+    res.json({ success: true, user: { id: user.id, username: user.username, banned: false } });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// List open reports with message + reporter + author context.
+app.get('/api/admin/reports', requireAdmin, (req, res) => {
+  try {
+    const db = loadDB();
+    const reports = (db.reports || [])
+      .filter(r => r.status === 'open')
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .map(r => {
+        const msg = db.messages.find(m => m.id === r.messageId);
+        const reporter = db.users.find(u => u.id === r.reporterId);
+        const author = msg ? db.users.find(u => u.id === msg.from) : null;
+        return {
+          id: r.id,
+          reason: r.reason,
+          createdAt: r.createdAt,
+          message: msg ? {
+            id: msg.id, text: msg.text, type: msg.type, timestamp: msg.timestamp,
+            deleted: !!msg.deleted, groupId: msg.groupId || null, from: msg.from
+          } : null,
+          reporter: reporter ? { id: reporter.id, username: reporter.username, displayName: reporter.displayName, avatar: reporter.avatar } : { id: r.reporterId, username: 'deleted', displayName: 'Deleted user' },
+          author: author ? { id: author.id, username: author.username, displayName: author.displayName, avatar: author.avatar, banned: !!author.banned } : null
+        };
+      });
+    res.json({ reports });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Resolve a report: action 'dismiss' keeps the message, 'delete' soft-deletes
+// it (and any thread replies under it), 'delete-ban' also bans the author.
+app.post('/api/admin/reports/:id/resolve', requireAdmin, (req, res) => {
+  try {
+    const { action } = req.body;
+    if (!['dismiss', 'delete', 'delete-ban'].includes(action)) {
+      return res.status(400).json({ error: 'Invalid action' });
+    }
+    const db = loadDB();
+    const report = (db.reports || []).find(r => r.id === req.params.id);
+    if (!report || report.status !== 'open') return res.status(404).json({ error: 'Report not found' });
+
+    const msg = db.messages.find(m => m.id === report.messageId);
+    const author = msg ? db.users.find(u => u.id === msg.from) : null;
+
+    if (action === 'delete' || action === 'delete-ban') {
+      if (msg && !msg.deleted) {
+        msg.deleted = true;
+        // Soft-delete thread replies attached to feedback posts too.
+        if (msg.groupId === FEEDBACK_HUB_ID) {
+          db.messages.forEach(m => {
+            if (m.parentId === msg.id) m.deleted = true;
+          });
+        }
+        io.emit('message_deleted', { messageId: msg.id });
+      }
+    }
+    if (action === 'delete-ban' && author && author.id !== req.userId) {
+      author.banned = true;
+      author.bannedAt = new Date().toISOString();
+      deleteAllSessionsForUser(author.id);
+      kickBannedUser(author.id, 'Your account has been banned for policy violations.');
+    }
+
+    report.status = 'resolved';
+    report.resolvedAt = new Date().toISOString();
+    report.resolvedBy = req.userId;
+    report.actionTaken = action;
+    saveDB(db);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Remove an abusive feedback-hub post (bug/feature/poll/reply) outright.
+app.post('/api/admin/feedback/:messageId/delete', requireAdmin, (req, res) => {
+  try {
+    const db = loadDB();
+    const msg = db.messages.find(m => m.id === req.params.messageId);
+    if (!msg || msg.groupId !== FEEDBACK_HUB_ID) return res.status(404).json({ error: 'Feedback post not found' });
+    msg.deleted = true;
+    db.messages.forEach(m => { if (m.parentId === msg.id) m.deleted = true; });
+    saveDB(db);
+    io.emit('message_deleted', { messageId: msg.id });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ============ SOCKET.IO ============
 const onlineUsers = new Map(); // userId -> socketId
 
@@ -1171,9 +1438,24 @@ io.use((socket, next) => {
   const token = socket.handshake.auth && socket.handshake.auth.token;
   const session = getSessionByToken(token);
   if (!session) return next(new Error('Unauthorized'));
+  const user = loadDB().users.find(u => u.id === session.userId);
+  if (!user) return next(new Error('Unauthorized'));
+  // Banned users cannot establish a realtime connection at all.
+  if (user.banned) return next(new Error('Banned'));
   socket.userId = session.userId;
   next();
 });
+
+// Kick a banned user's live socket(s) and tell their clients why.
+function kickBannedUser(userId, message) {
+  const sockId = onlineUsers.get(userId);
+  if (sockId) {
+    io.to(sockId).emit('account_banned', { message });
+    const sock = io.sockets.sockets.get(sockId);
+    if (sock) sock.disconnect(true);
+  }
+  onlineUsers.delete(userId);
+}
 
 io.on('connection', (socket) => {
   console.log('Socket connected:', socket.id);
