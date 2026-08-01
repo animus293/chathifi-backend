@@ -201,7 +201,7 @@ let dbCacheMtime = 0;
 
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) {
-    const initial = { users: [], groups: [], messages: [], sessions: [], reports: [] };
+    const initial = { users: [], groups: [], messages: [], sessions: [], reports: [], appeals: [] };
     fs.writeFileSync(DB_PATH, JSON.stringify(initial));
     dbCache = initial;
     dbCacheMtime = fs.statSync(DB_PATH).mtimeMs;
@@ -213,6 +213,7 @@ function loadDB() {
   // Normalize legacy databases: missing collections + missing per-user fields.
   if (!Array.isArray(dbCache.sessions)) dbCache.sessions = [];
   if (!Array.isArray(dbCache.reports)) dbCache.reports = [];
+  if (!Array.isArray(dbCache.appeals)) dbCache.appeals = [];
   let changed = false;
   (dbCache.users || []).forEach(u => {
     if (u.role === undefined) { u.role = 'user'; changed = true; }
@@ -470,8 +471,10 @@ app.post('/api/login', async (req, res) => {
 // Requires a valid session token. Sets req.userId from the verified session;
 // client-supplied userId parameters are only honored when they match req.userId.
 app.use('/api', (req, res, next) => {
-  // Public endpoints: signup + login only
-  if (req.path === '/signup' || req.path === '/login') return next();
+  // Public endpoints: signup + login only. Appeals are also public because a
+  // banned user cannot authenticate — the appeal identifies them by username
+  // and is only accepted when the account is actually banned.
+  if (req.path === '/signup' || req.path === '/login' || req.path === '/appeals') return next();
   return requireAuth(req, res, next);
 });
 
@@ -1421,6 +1424,120 @@ app.post('/api/admin/feedback/:messageId/delete', requireAdmin, (req, res) => {
     db.messages.forEach(m => { if (m.parentId === msg.id) m.deleted = true; });
     saveDB(db);
     io.emit('message_deleted', { messageId: msg.id });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ============ BAN APPEALS ============
+// A banned user cannot authenticate, so appeals are PUBLIC (exempted in the
+// /api auth middleware). They identify the account by username and are only
+// accepted when that account is actually banned — one open appeal per user.
+
+const APPEAL_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const APPEAL_MAX = 3;                    // appeals per IP per hour
+const APPEAL_REASON_MIN = 10;            // min chars so appeals are substantive
+
+app.post('/api/appeals', (req, res) => {
+  try {
+    const ipLimit = rateLimit(`appeal:ip:${req.ip}`, { windowMs: APPEAL_WINDOW_MS, max: APPEAL_MAX });
+    if (!ipLimit.allowed) return sendTooMany(res, ipLimit.retryAfterMs, 'Too many appeals from this network. Please wait.');
+
+    const { username, reason } = req.body;
+    if (!username || !reason || String(reason).trim().length < APPEAL_REASON_MIN) {
+      return res.status(400).json({ error: 'Please explain your appeal in a few sentences.' });
+    }
+
+    const db = loadDB();
+    const user = db.users.find(u => String(u.username).toLowerCase() === String(username).toLowerCase());
+    if (!user || !user.banned) {
+      // Don't reveal whether the account exists; only banned accounts can appeal.
+      return res.status(403).json({ error: 'This account is not eligible to appeal.' });
+    }
+
+    if (!Array.isArray(db.appeals)) db.appeals = [];
+    const open = db.appeals.find(a => a.userId === user.id && a.status === 'open');
+    if (open) return res.json({ success: true, alreadyAppealed: true });
+
+    db.appeals.push({
+      id: uuidv4(),
+      userId: user.id,
+      username: user.username,
+      displayName: user.displayName || user.username,
+      reason: String(reason).trim().slice(0, 2000),
+      status: 'open',
+      createdAt: new Date().toISOString(),
+      resolvedAt: null,
+      resolvedBy: null
+    });
+    saveDB(db);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// List open appeals with user context (admin only).
+app.get('/api/admin/appeals', requireAdmin, (req, res) => {
+  try {
+    const db = loadDB();
+    const appeals = (db.appeals || [])
+      .filter(a => a.status === 'open')
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .map(a => {
+        const user = db.users.find(u => u.id === a.userId);
+        return {
+          id: a.id,
+          username: a.username,
+          displayName: a.displayName,
+          reason: a.reason,
+          createdAt: a.createdAt,
+          bannedAt: user ? user.bannedAt : null,
+          messageCount: user ? db.messages.filter(m => m.from === user.id && !m.deleted).length : 0,
+          priorReports: user ? (db.reports || []).filter(r => {
+            const m = db.messages.find(x => x.id === r.messageId);
+            return m && m.from === user.id;
+          }).length : 0
+        };
+      });
+    res.json({ appeals });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Approve an appeal — unbans the user so they can log in again.
+app.post('/api/admin/appeals/:id/approve', requireAdmin, (req, res) => {
+  try {
+    const db = loadDB();
+    const appeal = (db.appeals || []).find(a => a.id === req.params.id);
+    if (!appeal || appeal.status !== 'open') return res.status(404).json({ error: 'Appeal not found' });
+    const user = db.users.find(u => u.id === appeal.userId);
+    if (user) {
+      user.banned = false;
+      user.bannedAt = null;
+    }
+    appeal.status = 'approved';
+    appeal.resolvedAt = new Date().toISOString();
+    appeal.resolvedBy = req.userId;
+    saveDB(db);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Reject an appeal — the user stays banned.
+app.post('/api/admin/appeals/:id/reject', requireAdmin, (req, res) => {
+  try {
+    const db = loadDB();
+    const appeal = (db.appeals || []).find(a => a.id === req.params.id);
+    if (!appeal || appeal.status !== 'open') return res.status(404).json({ error: 'Appeal not found' });
+    appeal.status = 'rejected';
+    appeal.resolvedAt = new Date().toISOString();
+    appeal.resolvedBy = req.userId;
+    saveDB(db);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
