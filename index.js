@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
@@ -8,28 +9,10 @@ const fs = require('fs');
 const multer = require('multer');
 const cors = require('cors');
 
-const helmet = require('helmet');
-const compression = require('compression');
-const rateLimit = require('express-rate-limit');
-
 const app = express();
-
-// 1. Security Headers (accurate/secure)
-app.use(helmet());
-
-// 2. Compress responses (smooth/fast)
-app.use(compression());
-
-// 3. API Rate Limiting (secure/accurate)
-const limiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  max: 200, // Limit each IP to 200 requests per windowMs
-  message: { error: 'Too many requests, please try again later.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-app.use(limiter);
-
+// Behind a reverse proxy (Railway/Render), req.ip is the real client address
+// only when Express trusts the immediate proxy hop.
+app.set('trust proxy', 1);
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -73,24 +56,106 @@ const upload = multer({
   }
 });
 
-// Feedback rate limiting
-const feedbackRateLimitMap = new Map();
-const FEEDBACK_RATE_LIMIT_WINDOW = 15000;
-const FEEDBACK_RATE_LIMIT_MAX = 5;
-function checkFeedbackRateLimit(userId) {
+// ============ RATE LIMITING ============
+// In-memory sliding-window limiters — no new dependencies. Buckets live in
+// memory by design: limits exist to stop bursts, and a server restart
+// naturally resets them (unlike sessions, which persist in db.json).
+//
+// Keys are namespaced: authenticated actions are scoped to the verified user
+// id; auth-attempt limits are scoped to IP (req.ip) and to the identifier so
+// a shared mobile/CGNAT IP can never lock out an entire network on its own.
+const rateLimitBuckets = new Map();
+
+// Record one attempt for `key` and report whether it is still allowed.
+// Returns { allowed, retryAfterMs } with retryAfterMs > 0 only when blocked.
+// Allows exactly `max` attempts per window (the (max+1)th is blocked).
+function rateLimit(key, { windowMs, max }) {
   const now = Date.now();
-  const entry = feedbackRateLimitMap.get(userId);
-  if (!entry) {
-    feedbackRateLimitMap.set(userId, { count: 1, start: now });
-    return true;
+  let entry = rateLimitBuckets.get(key);
+  if (!entry || now - entry.start >= entry.windowMs) {
+    entry = { start: now, count: 0, windowMs };
+    rateLimitBuckets.set(key, entry);
   }
-  if (now - entry.start > FEEDBACK_RATE_LIMIT_WINDOW) {
-    feedbackRateLimitMap.set(userId, { count: 1, start: now });
-    return true;
-  }
-  if (entry.count >= FEEDBACK_RATE_LIMIT_MAX) return false;
   entry.count++;
+  if (entry.count > max) {
+    return { allowed: false, retryAfterMs: Math.max(0, entry.windowMs - (now - entry.start)) };
+  }
+  return { allowed: true, retryAfterMs: 0 };
+}
+
+// Check whether `key` is currently blocked WITHOUT consuming an attempt.
+// Used for buckets that should only count failures (e.g. login IP bucket), so
+// legitimate traffic never burns budget. Blocks once `max` attempts are used.
+function checkRateLimit(key, { windowMs, max }) {
+  const now = Date.now();
+  const entry = rateLimitBuckets.get(key);
+  if (!entry || now - entry.start >= entry.windowMs) return { allowed: true, retryAfterMs: 0 };
+  if (entry.count >= max) {
+    return { allowed: false, retryAfterMs: Math.max(0, entry.windowMs - (now - entry.start)) };
+  }
+  return { allowed: true, retryAfterMs: 0 };
+}
+
+// Periodic sweep so abandoned keys never accumulate in memory.
+setInterval(() => {
+  const now = Date.now();
+  rateLimitBuckets.forEach((entry, key) => {
+    if (now - entry.start >= entry.windowMs) rateLimitBuckets.delete(key);
+  });
+}, 60 * 1000);
+
+// HTTP 429 helper (sets the standard Retry-After header).
+function sendTooMany(res, retryAfterMs, message) {
+  res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+  return res.status(429).json({ error: message, retryAfterMs });
+}
+
+// Socket-side limit. Fire-and-forget events have no acks, so on violation we
+// emit `rate_limited` back so the client can tell the user why nothing
+// happened and how long to wait.
+function socketRateLimit(socket, key, { windowMs, max, event, label }) {
+  const result = rateLimit(key, { windowMs, max });
+  if (!result.allowed) {
+    const secs = Math.ceil(result.retryAfterMs / 1000);
+    socket.emit('rate_limited', {
+      event,
+      retryAfterMs: result.retryAfterMs,
+      message: `${label} — try again in ${secs}s.`
+    });
+    return false;
+  }
   return true;
+}
+
+// ---- Limits ----
+// Auth attempts (brute-force protection)
+const AUTH_IP_WINDOW_MS = 15 * 60 * 1000;   // 15 min
+const AUTH_IP_MAX = 30;                     // login attempts per IP per window
+const AUTH_USER_WINDOW_MS = 15 * 60 * 1000; // 15 min
+const AUTH_USER_MAX = 5;                    // failed logins per username per window
+const SIGNUP_WINDOW_MS = 60 * 60 * 1000;    // 1 hour
+const SIGNUP_MAX = 20;                      // signups per IP per hour
+
+// Authenticated actions (spam protection)
+const MSG_WINDOW_MS = 15 * 1000;
+const MSG_MAX = 30;                  // sends per user per 15s (socket + HTTP reply share one bucket)
+const REACT_WINDOW_MS = 30 * 1000;
+const REACT_MAX = 30;
+const EDIT_DELETE_WINDOW_MS = 60 * 1000;
+const EDIT_DELETE_MAX = 20;
+const VOTE_WINDOW_MS = 30 * 1000;
+const VOTE_MAX = 30;
+const UPLOAD_WINDOW_MS = 60 * 1000;
+const UPLOAD_MAX = 10;
+const SEARCH_WINDOW_MS = 30 * 1000;
+const SEARCH_MAX = 20;
+const POLL_WINDOW_MS = 60 * 1000;
+const POLL_MAX = 60;  // the Android background service polls ~15/min
+
+// Feedback submissions (bug/feature/thread replies) — kept as a named helper
+// because several socket handlers call it.
+function checkFeedbackRateLimit(userId) {
+  return rateLimit(`feedback:${userId}`, { windowMs: 15000, max: 5 }).allowed;
 }
 
 function ensureFeedbackHub() {
@@ -132,7 +197,7 @@ let dbCacheMtime = 0;
 
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) {
-    const initial = { users: [], groups: [], messages: [] };
+    const initial = { users: [], groups: [], messages: [], sessions: [] };
     fs.writeFileSync(DB_PATH, JSON.stringify(initial, null, 2));
     dbCache = initial;
     dbCacheMtime = Date.now();
@@ -141,6 +206,8 @@ function loadDB() {
   const stat = fs.statSync(DB_PATH);
   if (dbCache && stat.mtimeMs === dbCacheMtime) return dbCache;
   dbCache = JSON.parse(fs.readFileSync(DB_PATH, 'utf-8'));
+  // Normalize legacy databases (pre-auth) that lack a sessions array.
+  if (!Array.isArray(dbCache.sessions)) dbCache.sessions = [];
   dbCacheMtime = stat.mtimeMs;
   return dbCache;
 }
@@ -151,8 +218,79 @@ function saveDB(data) {
   dbCacheMtime = Date.now();
 }
 
+// ============ SESSION TOKENS ============
+// Opaque, server-generated bearer tokens. A token maps to exactly one user.
+// Client-supplied identity (userId in body/query/socket payload) is NEVER
+// trusted — the authenticated userId always comes from the verified session.
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+function createSession(userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const db = loadDB();
+  if (!Array.isArray(db.sessions)) db.sessions = [];
+  pruneSessions(db);
+  db.sessions.push({ token, userId, createdAt: new Date().toISOString() });
+  saveDB(db);
+  return token;
+}
+
+function deleteSession(token) {
+  if (!token) return;
+  const db = loadDB();
+  if (!Array.isArray(db.sessions)) return;
+  const before = db.sessions.length;
+  db.sessions = db.sessions.filter(s => s.token !== token);
+  if (db.sessions.length !== before) saveDB(db);
+}
+
+function pruneSessions(db) {
+  // Returns true if any expired sessions were removed (caller persists once).
+  if (!Array.isArray(db.sessions)) return false;
+  const cutoff = Date.now() - SESSION_TTL_MS;
+  const before = db.sessions.length;
+  db.sessions = db.sessions.filter(s => {
+    const t = new Date(s.createdAt || 0).getTime();
+    return !isNaN(t) && t > cutoff;
+  });
+  return db.sessions.length !== before;
+}
+
+function getSessionByToken(token) {
+  if (!token) return null;
+  const db = loadDB();
+  const session = (db.sessions || []).find(s => s.token === token) || null;
+  if (!session) return null;
+  // Enforce TTL on every lookup so an expired session can never be reused.
+  const t = new Date(session.createdAt || 0).getTime();
+  if (isNaN(t) || Date.now() - t > SESSION_TTL_MS) {
+    deleteSession(token);
+    return null;
+  }
+  return session;
+}
+
+function isUserPartyToMessage(msg, userId) {
+  if (!msg) return false;
+  if (msg.groupId) {
+    const group = loadDB().groups.find(g => g.id === msg.groupId);
+    return !!group && group.members.includes(userId);
+  }
+  return String(msg.from) === String(userId) || String(msg.to) === String(userId);
+}
+
+function requireAuth(req, res, next) {
+  const authHeader = req.headers['authorization'] || '';
+  const token = authHeader.startsWith('Bearer ')
+    ? authHeader.slice(7)
+    : (req.headers['x-auth-token'] || '');
+  const session = getSessionByToken(token);
+  if (!session) return res.status(401).json({ error: 'Unauthorized' });
+  req.userId = session.userId;
+  next();
+}
+
 // Middleware
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json());
 app.use(express.static(path.join(__dirname, '..', 'public'), { maxAge: 0 }));
 app.use('/uploads', express.static(UPLOADS_PATH));
 
@@ -162,6 +300,14 @@ app.use('/uploads', express.static(UPLOADS_PATH));
 app.post('/api/signup', async (req, res) => {
   try {
     const { username, password, displayName } = req.body;
+
+    // Anti-spam: cap account creation per IP. Generous because mobile CGNATs
+    // share public IPs; the per-username login limiter is the real gate.
+    const ipLimit = rateLimit(`signup:ip:${req.ip}`, { windowMs: SIGNUP_WINDOW_MS, max: SIGNUP_MAX });
+    if (!ipLimit.allowed) {
+      return sendTooMany(res, ipLimit.retryAfterMs, 'Too many accounts created from this network. Please try again later.');
+    }
+
     const db = loadDB();
 
     if (!username || !password) {
@@ -205,7 +351,8 @@ app.post('/api/signup', async (req, res) => {
     saveDB(db);
 
     const { password: _, ...userWithoutPassword } = newUser;
-    res.json({ success: true, user: userWithoutPassword, token: newUser.id });
+    const token = createSession(newUser.id);
+    res.json({ success: true, user: userWithoutPassword, token });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -215,15 +362,33 @@ app.post('/api/signup', async (req, res) => {
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
+
+    // Brute-force protection. Both the per-IP and per-username buckets count
+    // FAILURES only (via checkRateLimit/rateLimit below), so a shared/CGNAT
+    // network can never be locked out by its own legitimate logins, and a
+    // legit owner's typos can never lock their own account — only actual
+    // brute-forcing consumes the budget.
+    const ipBlocked = checkRateLimit(`auth:ip:${req.ip}`, { windowMs: AUTH_IP_WINDOW_MS, max: AUTH_IP_MAX });
+    if (!ipBlocked.allowed) {
+      return sendTooMany(res, ipBlocked.retryAfterMs, 'Too many failed login attempts from this network. Please try again later.');
+    }
+
     const db = loadDB();
 
     const user = db.users.find(u => u.username.toLowerCase() === username.toLowerCase());
     if (!user) {
+      // Count the failure against the IP bucket (username is unknown).
+      rateLimit(`auth:ip:${req.ip}`, { windowMs: AUTH_IP_WINDOW_MS, max: AUTH_IP_MAX });
       return res.status(401).json({ error: 'Invalid username or password' });
     }
 
     const validPassword = await bcrypt.compare(password, user.password);
     if (!validPassword) {
+      rateLimit(`auth:ip:${req.ip}`, { windowMs: AUTH_IP_WINDOW_MS, max: AUTH_IP_MAX });
+      const userLimit = rateLimit(`auth:user:${username.toLowerCase()}`, { windowMs: AUTH_USER_WINDOW_MS, max: AUTH_USER_MAX });
+      if (!userLimit.allowed) {
+        return sendTooMany(res, userLimit.retryAfterMs, 'Too many failed login attempts. Please wait before trying again.');
+      }
       return res.status(401).json({ error: 'Invalid username or password' });
     }
 
@@ -232,10 +397,30 @@ app.post('/api/login', async (req, res) => {
     saveDB(db);
 
     const { password: _, ...userWithoutPassword } = user;
-    res.json({ success: true, user: userWithoutPassword, token: user.id });
+    const token = createSession(user.id);
+    res.json({ success: true, user: userWithoutPassword, token });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+// ============ AUTH MIDDLEWARE (applies to all /api routes below) ============
+// Requires a valid session token. Sets req.userId from the verified session;
+// client-supplied userId parameters are only honored when they match req.userId.
+app.use('/api', (req, res, next) => {
+  // Public endpoints: signup + login only
+  if (req.path === '/signup' || req.path === '/login') return next();
+  return requireAuth(req, res, next);
+});
+
+// Logout — revoke the current session server-side (requires auth).
+app.post('/api/logout', (req, res) => {
+  const authHeader = req.headers['authorization'] || '';
+  const token = authHeader.startsWith('Bearer ')
+    ? authHeader.slice(7)
+    : (req.headers['x-auth-token'] || '');
+  deleteSession(token);
+  res.json({ success: true });
 });
 
 // Search users
@@ -270,7 +455,14 @@ app.get('/api/users/:id', (req, res) => {
 });
 
 // ============ FILE UPLOAD ============
-app.post('/api/upload', upload.single('file'), (req, res) => {
+app.post('/api/upload',
+  // Check the per-user limit BEFORE multer saves the file (no orphan uploads).
+  (req, res, next) => {
+    const result = rateLimit(`upload:${req.userId}`, { windowMs: UPLOAD_WINDOW_MS, max: UPLOAD_MAX });
+    if (!result.allowed) return sendTooMany(res, result.retryAfterMs, 'Uploading too fast — try again shortly.');
+    next();
+  },
+  upload.single('file'), (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const fileUrl = `/uploads/${req.file.filename}`;
@@ -283,7 +475,13 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
 // ============ MESSAGE SEARCH ============
 app.get('/api/messages/search', (req, res) => {
   try {
-    const { q, userId, groupId } = req.query;
+    const { q, groupId } = req.query;
+    const userId = req.userId;
+
+    // Search scans all messages — prevent scripted hammering of the DB.
+    const result = rateLimit(`search:${userId}`, { windowMs: SEARCH_WINDOW_MS, max: SEARCH_MAX });
+    if (!result.allowed) return sendTooMany(res, result.retryAfterMs, 'Searching too fast — try again shortly.');
+
     const db = loadDB();
     if (!q) return res.json({ messages: [] });
 
@@ -291,14 +489,16 @@ app.get('/api/messages/search', (req, res) => {
     let results;
 
     if (groupId) {
+      const group = db.groups.find(g => g.id === groupId);
+      if (!group || !group.members.includes(userId)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
       results = db.messages.filter(m => m.groupId === groupId && !m.deleted && m.text && m.text.toLowerCase().includes(query));
-    } else if (userId) {
+    } else {
       results = db.messages.filter(m =>
         !m.groupId && !m.deleted && m.text && m.text.toLowerCase().includes(query) &&
         (m.from === userId || m.to === userId)
       );
-    } else {
-      results = db.messages.filter(m => !m.deleted && m.text && m.text.toLowerCase().includes(query) && (m.from === userId || m.to === userId));
     }
 
     results.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
@@ -311,8 +511,11 @@ app.get('/api/messages/search', (req, res) => {
 // ============ UPDATE PROFILE ============
 app.put('/api/users/:id/profile', (req, res) => {
   try {
+    if (req.params.id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     const db = loadDB();
-    const user = db.users.find(u => u.id === req.params.id);
+    const user = db.users.find(u => u.id === req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     const { displayName, bio, avatar } = req.body;
     if (displayName) user.displayName = displayName;
@@ -338,9 +541,12 @@ app.put('/api/users/:id/profile', (req, res) => {
 // ============ BLOCK USER ============
 app.post('/api/users/:userId/block', (req, res) => {
   try {
+    if (req.params.userId !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     const { targetUserId, action } = req.body;
     const db = loadDB();
-    const user = db.users.find(u => u.id === req.params.userId);
+    const user = db.users.find(u => u.id === req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (!user.blockedUsers) user.blockedUsers = [];
 
@@ -365,8 +571,11 @@ app.post('/api/users/:userId/block', (req, res) => {
 // Get blocked users with details
 app.get('/api/users/:userId/blocked', (req, res) => {
   try {
+    if (req.params.userId !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     const db = loadDB();
-    const user = db.users.find(u => u.id === req.params.userId);
+    const user = db.users.find(u => u.id === req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     const blockedIds = user.blockedUsers || [];
     const blockedUsers = blockedIds.map(id => {
@@ -384,9 +593,12 @@ app.get('/api/users/:userId/blocked', (req, res) => {
 // ============ MUTE CONVERSATION ============
 app.post('/api/users/:userId/mute', (req, res) => {
   try {
+    if (req.params.userId !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     const { conversationId, action } = req.body;
     const db = loadDB();
-    const user = db.users.find(u => u.id === req.params.userId);
+    const user = db.users.find(u => u.id === req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (!user.mutedConversations) user.mutedConversations = [];
 
@@ -411,8 +623,11 @@ app.post('/api/users/:userId/mute', (req, res) => {
 // Get muted conversation IDs for a user
 app.get('/api/users/:userId/muted', (req, res) => {
   try {
+    if (req.params.userId !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     const db = loadDB();
-    const user = db.users.find(u => u.id === req.params.userId);
+    const user = db.users.find(u => u.id === req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json({ mutedConversations: user.mutedConversations || [] });
   } catch (err) {
@@ -425,8 +640,11 @@ app.get('/api/users/:userId/muted', (req, res) => {
 // Get all conversations for a user (DM partners + groups)
 app.get('/api/conversations/:userId', async (req, res) => {
   try {
+    if (req.params.userId !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     const db = loadDB();
-    const userId = req.params.userId;
+    const userId = req.userId;
 
     // Get blocked + muted sets for the requesting user
     const currentUser = db.users.find(u => u.id === userId);
@@ -521,8 +739,9 @@ app.get('/api/conversations/:userId', async (req, res) => {
 // Create group
 app.post('/api/groups', (req, res) => {
   try {
-    const { name, description, members, createdBy } = req.body;
+    const { name, description, members } = req.body;
     const db = loadDB();
+    const createdBy = req.userId;
 
     if (!name || !createdBy) {
       return res.status(400).json({ error: 'Group name required' });
@@ -550,8 +769,11 @@ app.post('/api/groups', (req, res) => {
 
 // Get user's groups
 app.get('/api/groups/:userId', (req, res) => {
+  if (req.params.userId !== req.userId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
   const db = loadDB();
-  const groups = db.groups.filter(g => g.members.includes(req.params.userId));
+  const groups = db.groups.filter(g => g.members.includes(req.userId));
   res.json({ groups });
 });
 
@@ -566,9 +788,10 @@ function notifyGroupMembers(group, event, payload, exceptUserId) {
 
 // Add member to group (admin only)
 app.post('/api/groups/:groupId/members', (req, res) => {
-  const { userId, requestedBy } = req.body;
+  const { userId } = req.body;
   const db = loadDB();
   const group = db.groups.find(g => g.id === req.params.groupId);
+  const requestedBy = req.userId;
 
   if (!group) return res.status(404).json({ error: 'Group not found' });
   if (!group.admins.includes(requestedBy)) {
@@ -586,9 +809,10 @@ app.post('/api/groups/:groupId/members', (req, res) => {
 
 // Remove member from group (admin or self-leave)
 app.post('/api/groups/:groupId/remove-member', (req, res) => {
-  const { userId, requestedBy } = req.body;
+  const { userId } = req.body;
   const db = loadDB();
   const group = db.groups.find(g => g.id === req.params.groupId);
+  const requestedBy = req.userId;
 
   if (!group) return res.status(404).json({ error: 'Group not found' });
   if (userId !== requestedBy && !group.admins.includes(requestedBy)) {
@@ -612,9 +836,9 @@ app.post('/api/groups/:groupId/remove-member', (req, res) => {
 
 // Delete whole group (creator/admin only)
 app.post('/api/groups/:groupId/delete', (req, res) => {
-  const { requestedBy } = req.body;
   const db = loadDB();
   const group = db.groups.find(g => g.id === req.params.groupId);
+  const requestedBy = req.userId;
 
   if (!group) return res.status(404).json({ error: 'Group not found' });
   if (!group.admins.includes(requestedBy)) {
@@ -638,9 +862,10 @@ app.post('/api/groups/:groupId/delete', (req, res) => {
 // Update group name/avatar (admin only)
 app.put('/api/groups/:groupId/update', (req, res) => {
   try {
-    const { name, avatar, requestedBy } = req.body;
+    const { name, avatar } = req.body;
     const db = loadDB();
     const group = db.groups.find(g => g.id === req.params.groupId);
+    const requestedBy = req.userId;
     if (!group) return res.status(404).json({ error: 'Group not found' });
     if (!group.admins.includes(requestedBy)) {
       return res.status(403).json({ error: 'Only admins can update the group' });
@@ -672,10 +897,10 @@ app.get('/api/groups/feedback/info', (req, res) => {
 // Auto-join endpoint (called after login if not joined)
 app.post('/api/feedback/auto-join', (req, res) => {
   try {
-    const { userId } = req.body;
     const db = loadDB();
     const hub = db.groups.find(g => g.id === FEEDBACK_HUB_ID);
     if (!hub) return res.status(404).json({ error: 'Feedback hub not found' });
+    const userId = req.userId;
     if (!hub.members.includes(userId)) {
       hub.members.push(userId);
       saveDB(db);
@@ -689,10 +914,11 @@ app.post('/api/feedback/auto-join', (req, res) => {
 // Update feedback hub info (admin only)
 app.put('/api/groups/feedback/update', (req, res) => {
   try {
-    const { name, description, rules, requestedBy } = req.body;
+    const { name, description, rules } = req.body;
     const db = loadDB();
     const hub = db.groups.find(g => g.id === FEEDBACK_HUB_ID);
     if (!hub) return res.status(404).json({ error: 'Feedback hub not found' });
+    const requestedBy = req.userId;
     if (!hub.admins.includes(requestedBy)) {
       return res.status(403).json({ error: 'Only admins can update the feedback hub' });
     }
@@ -710,7 +936,8 @@ app.put('/api/groups/feedback/update', (req, res) => {
 // Update bug status (admin only)
 app.put('/api/bugs/:messageId/status', (req, res) => {
   try {
-    const { status, requestedBy } = req.body;
+    const { status } = req.body;
+    const requestedBy = req.userId;
     const validStatuses = ['open', 'confirmed', 'in-progress', 'fixed', 'wontfix'];
     if (!validStatuses.includes(status)) return res.status(400).json({ error: 'Invalid status' });
 
@@ -736,7 +963,8 @@ app.put('/api/bugs/:messageId/status', (req, res) => {
 // Update feature status (admin only)
 app.put('/api/features/:messageId/status', (req, res) => {
   try {
-    const { status, requestedBy } = req.body;
+    const { status } = req.body;
+    const requestedBy = req.userId;
     const validStatuses = ['suggested', 'under-review', 'planned', 'in-progress', 'completed', 'declined'];
     if (!validStatuses.includes(status)) return res.status(400).json({ error: 'Invalid status' });
 
@@ -779,8 +1007,13 @@ app.get('/api/feedback/messages', (req, res) => {
 // Poll new unread messages for background native service (0 dependencies, 100% private)
 app.get('/api/notifications/poll', (req, res) => {
   try {
-    const { userId, since } = req.query;
+    const { since } = req.query;
+    const userId = req.userId;
     if (!userId) return res.json({ unread: [] });
+    // The Android background service polls every ~4s (15/min); 60/min is a
+    // generous safety net against runaway or misconfigured clients.
+    const result = rateLimit(`poll:${userId}`, { windowMs: POLL_WINDOW_MS, max: POLL_MAX });
+    if (!result.allowed) return sendTooMany(res, result.retryAfterMs, 'Polling too frequently.');
     const db = loadDB();
     const sinceDate = since ? new Date(Number(since)) : new Date(Date.now() - 30000);
 
@@ -825,7 +1058,12 @@ app.get('/api/notifications/poll', (req, res) => {
 // HTTP endpoint for Android status bar inline replies (0 dependencies)
 app.post('/api/messages/reply', (req, res) => {
   try {
-    const { from, to, groupId, text, replyTo } = req.body;
+    // Shares the same per-user budget as socket sends (one bucket per user).
+    const result = rateLimit(`msg:${req.userId}`, { windowMs: MSG_WINDOW_MS, max: MSG_MAX });
+    if (!result.allowed) return sendTooMany(res, result.retryAfterMs, 'Sending messages too fast — try again shortly.');
+
+    const { to, groupId, text, replyTo } = req.body;
+    const from = req.userId;
     if (!from || (!to && !groupId) || !text) return res.status(400).json({ error: 'Missing required parameters' });
 
     const db = loadDB();
@@ -883,6 +1121,16 @@ app.get('/api/messages', (req, res) => {
     const limitNum = Number(limit);
     const skipNum = Number(skip);
 
+    // Only allow reading conversations the authenticated user is party to.
+    if (groupId) {
+      const group = db.groups.find(g => g.id === groupId);
+      if (!group || !group.members.includes(req.userId)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    } else if (String(from) !== String(req.userId) && String(to) !== String(req.userId)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
     // Messages are stored in chronological order (newest last).
     // Iterate backwards from the end to collect the most recent `limit` matches.
     const result = [];
@@ -915,13 +1163,25 @@ app.get('/api/messages', (req, res) => {
 // ============ SOCKET.IO ============
 const onlineUsers = new Map(); // userId -> socketId
 
+// Authenticate every socket connection with the same opaque session token
+// used for HTTP. The verified user id is attached as socket.userId and is the
+// ONLY trusted identity for all subsequent events (client-supplied ids are
+// ignored everywhere below).
+io.use((socket, next) => {
+  const token = socket.handshake.auth && socket.handshake.auth.token;
+  const session = getSessionByToken(token);
+  if (!session) return next(new Error('Unauthorized'));
+  socket.userId = session.userId;
+  next();
+});
+
 io.on('connection', (socket) => {
   console.log('Socket connected:', socket.id);
 
   // User comes online
-  socket.on('user_online', (userId) => {
+  socket.on('user_online', () => {
+    const userId = socket.userId;
     onlineUsers.set(userId, socket.id);
-    socket.userId = userId;
 
     // Broadcast to all
     io.emit('user_status', { userId, online: true });
@@ -932,23 +1192,27 @@ io.on('connection', (socket) => {
 
   // Avatar (DP) update
   socket.on('update_avatar', (data) => {
+    const userId = socket.userId;
     const db = loadDB();
-    const user = db.users.find(u => u.id === data.userId);
+    const user = db.users.find(u => u.id === userId);
     if (user) {
       user.avatar = data.avatarUrl;
       saveDB(db);
-      io.emit('user_avatar_updated', { userId: data.userId, avatarUrl: data.avatarUrl });
+      io.emit('user_avatar_updated', { userId, avatarUrl: data.avatarUrl });
     }
   });
 
   // Profile update (name/bio) sync
   socket.on('update_profile', (data) => {
-    io.emit('user_profile_updated', { userId: data.userId, displayName: data.displayName, bio: data.bio });
+    const userId = socket.userId;
+    io.emit('user_profile_updated', { userId, displayName: data.displayName, bio: data.bio });
   });
 
   // Send DM
   socket.on('send_message', (data) => {
-    const { from, to, text, type = 'text', mediaUrl = null, replyTo = null, p2pId = null, p2pMeta = null } = data;
+    if (!socketRateLimit(socket, `msg:${socket.userId}`, { windowMs: MSG_WINDOW_MS, max: MSG_MAX, event: 'send_message', label: 'Sending messages too fast' })) return;
+    const { to, text, type = 'text', mediaUrl = null, replyTo = null, p2pId = null, p2pMeta = null } = data;
+    const from = socket.userId;
     const db = loadDB();
 
     // Check if sender is blocked by the recipient
@@ -993,9 +1257,11 @@ io.on('connection', (socket) => {
     socket.emit('message_sent', message);
   });
 
-  // Send group message
+  // Send group message (shares the same per-user budget as DMs)
   socket.on('send_group_message', (data) => {
-    const { from, groupId, text, type = 'text', mediaUrl = null, replyTo = null, p2pId = null, p2pMeta = null } = data;
+    if (!socketRateLimit(socket, `msg:${socket.userId}`, { windowMs: MSG_WINDOW_MS, max: MSG_MAX, event: 'send_group_message', label: 'Sending messages too fast' })) return;
+    const { groupId, text, type = 'text', mediaUrl = null, replyTo = null, p2pId = null, p2pMeta = null } = data;
+    const from = socket.userId;
     const db = loadDB();
 
     const group = db.groups.find(g => g.id === groupId);
@@ -1037,7 +1303,8 @@ io.on('connection', (socket) => {
 
   // Typing indicator
   socket.on('typing', (data) => {
-    const { to, from, groupId } = data;
+    const { to, groupId } = data;
+    const from = socket.userId;
     if (groupId) {
       const group = loadDB().groups.find(g => g.id === groupId);
       if (group) {
@@ -1056,7 +1323,8 @@ io.on('connection', (socket) => {
   });
 
   socket.on('stop_typing', (data) => {
-    const { to, from, groupId } = data;
+    const { to, groupId } = data;
+    const from = socket.userId;
     if (groupId) {
       const group = loadDB().groups.find(g => g.id === groupId);
       if (group) {
@@ -1076,28 +1344,36 @@ io.on('connection', (socket) => {
 
   // Mark read
   socket.on('mark_read', (data) => {
-    const { messageIds, userId } = data;
+    const { messageIds } = data;
+    const userId = socket.userId;
     const db = loadDB();
+    const processed = [];
     messageIds.forEach(id => {
       const msg = db.messages.find(m => m.id === id);
-      if (msg) {
+      // Only allow marking messages in conversations the user is party to.
+      if (msg && isUserPartyToMessage(msg, userId)) {
         msg.read = true;
         if (!msg.readBy) msg.readBy = [];
         if (userId && !msg.readBy.includes(userId)) {
           msg.readBy.push(userId);
         }
+        processed.push(id);
       }
     });
     saveDB(db);
-    io.emit('messages_read', { messageIds, userId });
+    // Only broadcast the ids that were actually updated.
+    if (processed.length > 0) {
+      io.emit('messages_read', { messageIds: processed, userId });
+    }
   });
 
-  // Edit message
+  // Edit message — only the author may edit
   socket.on('edit_message', (data) => {
+    if (!socketRateLimit(socket, `edit:${socket.userId}`, { windowMs: EDIT_DELETE_WINDOW_MS, max: EDIT_DELETE_MAX, event: 'edit_message', label: 'Editing messages too fast' })) return;
     const { messageId, text } = data;
     const db = loadDB();
     const msg = db.messages.find(m => m.id === messageId);
-    if (!msg) return;
+    if (!msg || msg.from !== socket.userId) return;
     msg.text = text;
     msg.edited = true;
     msg.editedAt = new Date().toISOString();
@@ -1105,12 +1381,15 @@ io.on('connection', (socket) => {
     io.emit('message_edited', { messageId, text, editedAt: msg.editedAt });
   });
 
-  // React to message
+  // React to message — identity is the verified socket user, and the user
+  // must be party to the message's conversation.
   socket.on('react', (data) => {
-    const { messageId, userId, emoji } = data;
+    if (!socketRateLimit(socket, `react:${socket.userId}`, { windowMs: REACT_WINDOW_MS, max: REACT_MAX, event: 'react', label: 'Reacting too fast' })) return;
+    const { messageId, emoji } = data;
+    const userId = socket.userId;
     const db = loadDB();
     const msg = db.messages.find(m => m.id === messageId);
-    if (msg) {
+    if (msg && isUserPartyToMessage(msg, userId)) {
       if (!msg.reactions) msg.reactions = {};
       if (msg.reactions[userId] === emoji) delete msg.reactions[userId];
       else msg.reactions[userId] = emoji;
@@ -1119,16 +1398,16 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Delete message
+  // Delete message — only the author may delete
   socket.on('delete_message', (data) => {
+    if (!socketRateLimit(socket, `del:${socket.userId}`, { windowMs: EDIT_DELETE_WINDOW_MS, max: EDIT_DELETE_MAX, event: 'delete_message', label: 'Deleting messages too fast' })) return;
     const { messageId } = data;
     const db = loadDB();
     const msg = db.messages.find(m => m.id === messageId);
-    if (msg) {
-      msg.deleted = true;
-      saveDB(db);
-      io.emit('message_deleted', { messageId });
-    }
+    if (!msg || msg.from !== socket.userId) return;
+    msg.deleted = true;
+    saveDB(db);
+    io.emit('message_deleted', { messageId });
   });
 
   // ===== WEBRTC DIRECT P2P FILE SIGNALING =====
@@ -1210,21 +1489,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('update_avatar', (data) => {
-    if (data && data.userId) {
-      io.emit('user_avatar_updated', { userId: data.userId, avatarUrl: data.avatarUrl });
-    }
-  });
-
-  socket.on('update_profile', (data) => {
-    if (data && data.userId) {
-      io.emit('user_profile_updated', data);
-    }
-  });
-
   // Delete feedback message (author or admin only)
   socket.on('feedback_delete_message', (data) => {
-    const { messageId, userId } = data;
+    const { messageId } = data;
+    const userId = socket.userId;
     const db = loadDB();
     const msg = db.messages.find(m => m.id === messageId);
     if (!msg || msg.groupId !== FEEDBACK_HUB_ID) return;
@@ -1240,7 +1508,8 @@ io.on('connection', (socket) => {
 
   // Submit bug report
   socket.on('submit_bug', (data) => {
-    const { from, text, mediaUrl } = data;
+    const from = socket.userId;
+    const { text, mediaUrl } = data;
     if (!text || !text.trim()) return socket.emit('feedback_error', { error: 'Bug description is required' });
 
     const db = loadDB();
@@ -1276,7 +1545,8 @@ io.on('connection', (socket) => {
 
   // Submit feature suggestion
   socket.on('submit_feature', (data) => {
-    const { from, text, mediaUrl } = data;
+    const from = socket.userId;
+    const { text, mediaUrl } = data;
     if (!text || !text.trim()) return socket.emit('feedback_error', { error: 'Feature description is required' });
 
     const db = loadDB();
@@ -1312,7 +1582,9 @@ io.on('connection', (socket) => {
 
   // Vote on feature
   socket.on('vote_feature', (data) => {
-    const { messageId, userId } = data;
+    if (!socketRateLimit(socket, `vote:${socket.userId}`, { windowMs: VOTE_WINDOW_MS, max: VOTE_MAX, event: 'vote_feature', label: 'Voting too fast' })) return;
+    const { messageId } = data;
+    const userId = socket.userId;
     const db = loadDB();
     const msg = db.messages.find(m => m.id === messageId);
     if (!msg || !msg._feature) return;
@@ -1329,7 +1601,8 @@ io.on('connection', (socket) => {
 
   // Create priority poll
   socket.on('create_poll', (data) => {
-    const { from, question, quadrant } = data;
+    const from = socket.userId;
+    const { question, quadrant } = data;
     if (!question || !question.trim()) return socket.emit('feedback_error', { error: 'Poll question is required' });
     if (!quadrant || !quadrant.length) return socket.emit('feedback_error', { error: 'At least one quadrant required' });
 
@@ -1368,7 +1641,9 @@ io.on('connection', (socket) => {
 
   // Vote on poll
   socket.on('vote_poll', (data) => {
-    const { messageId, userId, cell } = data;
+    if (!socketRateLimit(socket, `vote:${socket.userId}`, { windowMs: VOTE_WINDOW_MS, max: VOTE_MAX, event: 'vote_poll', label: 'Voting too fast' })) return;
+    const { messageId, cell } = data;
+    const userId = socket.userId;
     const db = loadDB();
     const msg = db.messages.find(m => m.id === messageId);
     if (!msg || !msg._poll) return;
@@ -1383,7 +1658,8 @@ io.on('connection', (socket) => {
 
   // Thread reply (for bug/feature discussions)
   socket.on('thread_reply', (data) => {
-    const { from, parentId, text, mediaUrl } = data;
+    const from = socket.userId;
+    const { parentId, text, mediaUrl } = data;
     if (!text || !text.trim()) return socket.emit('feedback_error', { error: 'Reply text is required' });
     if (!checkFeedbackRateLimit(from)) return socket.emit('feedback_error', { error: 'You are replying too fast. Please wait.' });
 
