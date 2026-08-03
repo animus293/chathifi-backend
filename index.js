@@ -41,22 +41,42 @@ if (!fs.existsSync(UPLOADS_PATH)) {
   fs.mkdirSync(UPLOADS_PATH, { recursive: true });
 }
 
-// Multer storage for file uploads
+// Multer storage for file uploads. SECURITY: the stored extension is derived
+// ONLY from the validated MIME type (never from the client-supplied original
+// filename) — so an uploaded "evil.html" (or any non-media extension) can
+// never be served back as same-origin HTML/JS from /uploads.
+const MIME_EXT = {
+  'image/jpeg': '.jpg',
+  // Some Android cameras report image/jpg with a .jpg filename.
+  'image/jpg': '.jpg',
+  'image/png': '.png',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'audio/mpeg': '.mp3',
+  'audio/ogg': '.ogg',
+  'audio/wav': '.wav',
+  'video/mp4': '.mp4',
+  'video/webm': '.webm'
+};
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOADS_PATH),
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${uuidv4()}${ext}`);
+    // Server-side extension from the MIME allowlist — originalname is ignored.
+    cb(null, `${uuidv4()}${MIME_EXT[file.mimetype] || '.bin'}`);
   }
 });
 const upload = multer({
   storage,
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = /jpeg|jpg|png|gif|webp|mp3|ogg|wav|mp4|webm/;
-    const extOk = allowed.test(path.extname(file.originalname).toLowerCase());
-    const mimeOk = allowed.test(file.mimetype.split('/')[1]);
-    cb(null, extOk || mimeOk);
+    // Require BOTH a known MIME type AND a matching extension. The old
+    // `extOk || mimeOk` accepted files like .html with a spoofed image MIME,
+    // which were then stored with their original extension and served as
+    // same-origin HTML (stored XSS). MIME is authoritative; the extension
+    // must agree so the stored name can never be an executable type.
+    const ext = path.extname(file.originalname).toLowerCase();
+    const expectedExt = MIME_EXT[file.mimetype];
+    cb(null, !!expectedExt && ext === expectedExt);
   }
 });
 
@@ -155,6 +175,8 @@ const SEARCH_WINDOW_MS = 30 * 1000;
 const SEARCH_MAX = 20;
 const POLL_WINDOW_MS = 60 * 1000;
 const POLL_MAX = 60;  // the Android background service polls ~15/min
+const UNREAD_WINDOW_MS = 15 * 1000;
+const UNREAD_MAX = 60; // feedback unread badge refresh (read-only scan guard)
 
 // Feedback submissions (bug/feature/thread replies) — kept as a named helper
 // because several socket handlers call it.
@@ -201,7 +223,7 @@ let dbCacheMtime = 0;
 
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) {
-    const initial = { users: [], groups: [], messages: [], sessions: [], reports: [], appeals: [] };
+    const initial = { users: [], groups: [], messages: [], sessions: [], reports: [], appeals: [], reactions: [] };
     fs.writeFileSync(DB_PATH, JSON.stringify(initial));
     dbCache = initial;
     dbCacheMtime = fs.statSync(DB_PATH).mtimeMs;
@@ -214,11 +236,30 @@ function loadDB() {
   if (!Array.isArray(dbCache.sessions)) dbCache.sessions = [];
   if (!Array.isArray(dbCache.reports)) dbCache.reports = [];
   if (!Array.isArray(dbCache.appeals)) dbCache.appeals = [];
+  if (!Array.isArray(dbCache.reactions)) dbCache.reactions = [];
   let changed = false;
   (dbCache.users || []).forEach(u => {
     if (u.role === undefined) { u.role = 'user'; changed = true; }
     if (u.banned === undefined) { u.banned = false; changed = true; }
     if (u.bannedAt === undefined) { u.bannedAt = null; changed = true; }
+  });
+  // Per-user read migration: read state is now per-user via readBy (the old
+  // single `read` boolean made one member's read look global). Legacy DMs with
+  // `read: true` can be attributed to the recipient; group reads can't be
+  // attributed, so those self-heal on each member's next open+mark_read.
+  (dbCache.messages || []).forEach(m => {
+    if (!Array.isArray(m.readBy)) {
+      m.readBy = (m.read === true && !m.groupId && m.to) ? [m.to] : [];
+      changed = true;
+    }
+  });
+  // Reaction "seen" state: readAt[userId] = when THAT user (the author of the
+  // reacted message) saw the reaction — powers the chat-list "reacted to your
+  // message" unread preview. Same per-user pattern as message readAt. Placed
+  // AFTER `let changed` so legacy DBs with existing reactions can't hit a
+  // temporal-dead-zone ReferenceError (crashed the deployed backend).
+  (dbCache.reactions || []).forEach(r => {
+    if (!r.readAt || typeof r.readAt !== 'object') { r.readAt = {}; changed = true; }
   });
   // Promote any env-configured admin usernames on every load (cheap, idempotent).
   if (ADMIN_USERNAMES.length) {
@@ -305,6 +346,23 @@ function isUserPartyToMessage(msg, userId) {
   return String(msg.from) === String(userId) || String(msg.to) === String(userId);
 }
 
+// Shared DM-send authorization. Used by BOTH the socket send_message handler
+// and the HTTP /api/messages/reply endpoint so the two paths can never drift
+// again (a previous drift left the HTTP path without block checks — a real
+// bypass). Returns { ok: true } or { ok: false, error, status }.
+function checkDMSend(db, from, to) {
+  const recipient = db.users.find(u => String(u.id) === String(to));
+  if (!recipient) return { ok: false, error: 'Recipient not found', status: 404 };
+  if ((recipient.blockedUsers || []).some(b => String(b) === String(from))) {
+    return { ok: false, error: 'You are blocked by this user', status: 403 };
+  }
+  const sender = db.users.find(u => String(u.id) === String(from));
+  if (sender && (sender.blockedUsers || []).some(b => String(b) === String(to))) {
+    return { ok: false, error: 'You have blocked this user. Unblock to send messages.', status: 403 };
+  }
+  return { ok: true };
+}
+
 function requireAuth(req, res, next) {
   const authHeader = req.headers['authorization'] || '';
   const token = authHeader.startsWith('Bearer ')
@@ -338,7 +396,13 @@ function isAdminUser(user) {
 // Middleware
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '..', 'public'), { maxAge: 0 }));
-app.use('/uploads', express.static(UPLOADS_PATH));
+// Defense in depth: never let the browser sniff a served upload as a different
+// type than its extension (blocks HTML/JS polyglot payloads even if a file
+// slips through validation).
+app.use('/uploads', (req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  next();
+}, express.static(UPLOADS_PATH));
 
 // ============ AUTH ROUTES ============
 
@@ -475,6 +539,9 @@ app.use('/api', (req, res, next) => {
   // banned user cannot authenticate — the appeal identifies them by username
   // and is only accepted when the account is actually banned.
   if (req.path === '/signup' || req.path === '/login' || req.path === '/appeals') return next();
+  // Update manifest is public on GET — clients must be able to check for
+  // updates before (or without) authenticating.
+  if (req.method === 'GET' && req.path === '/update/manifest') return next();
   return requireAuth(req, res, next);
 });
 
@@ -504,8 +571,9 @@ app.get('/api/users/search', (req, res) => {
     }
 
     // Public listing — never expose moderation fields (role/banned) to regular
-    // users; the admin panel has its own admin-only endpoint for that.
-    const results = users.map(({ password, role, banned, bannedAt, ...u }) => u);
+    // users; the admin panel has its own admin-only endpoint for that. The
+    // isAdmin boolean is safe: it only advertises who the global admins are.
+    const results = users.map(({ password, role, banned, bannedAt, ...u }) => ({ ...u, isAdmin: role === 'admin' }));
     res.json({ users: results });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -520,7 +588,10 @@ app.get('/api/users/:id', (req, res) => {
   const isSelf = String(user.id) === String(req.userId);
   const isAdmin = isAdminUser(req.user);
   const { password, role, banned, bannedAt, ...rest } = user;
-  const u = (isSelf || isAdmin) ? { ...rest, role, banned, bannedAt } : rest;
+  // Everyone sees an isAdmin flag (powers the crown badges); role/banned stay
+  // private unless viewing your own profile or you're an admin.
+  const publicUser = { ...rest, isAdmin: role === 'admin' };
+  const u = (isSelf || isAdmin) ? { ...publicUser, role, banned, bannedAt } : publicUser;
   res.json({ user: u });
 });
 
@@ -738,7 +809,10 @@ app.get('/api/conversations/:userId', async (req, res) => {
         if (!groupLastMsg[m.groupId] || ts > groupLastMsg[m.groupId].timestamp) {
           groupLastMsg[m.groupId] = { text, timestamp: ts };
         }
-        if (m.from !== userId && !m.read) {
+        // Per-user read state: a message is unread for THIS user until THEIR id
+        // is in readBy. Bob reading Alice's message must never clear Carol's
+        // badge — or prevent Carol's receipt avatar from ever appearing.
+        if (m.from !== userId && !(m.readBy || []).includes(userId)) {
           groupUnread[m.groupId] = (groupUnread[m.groupId] || 0) + 1;
         }
       } else if (m.from === userId || m.to === userId) {
@@ -748,28 +822,68 @@ app.get('/api/conversations/:userId', async (req, res) => {
         if (!dmLastMsg[partnerId] || ts > dmLastMsg[partnerId].timestamp) {
           dmLastMsg[partnerId] = { text, timestamp: ts };
         }
-        if (m.from === partnerId && !m.read) {
+        if (m.from === partnerId && !(m.readBy || []).includes(userId)) {
           dmUnread[partnerId] = (dmUnread[partnerId] || 0) + 1;
         }
       }
     }
 
+    // Reactions targeting THIS user that they haven't seen yet (readAt[userId]
+    // unset). Each becomes a chat-list preview "reacted 🧐 to your message"
+    // (WhatsApp-style, name omitted per request), counts as unread, and bumps
+    // the conversation to the top if it's newer than the last real message.
+    // Keyed by conversationId; only the most recent unseen reaction per
+    // conversation drives the preview, all of them count toward unread.
+    const convReactions = {}; // conversationId -> { preview, ts, count }
+    (db.reactions || []).forEach(r => {
+      if (String(r.targetUserId) !== String(userId)) return;
+      if (r.readAt && r.readAt[userId]) return;
+      const convId = String(r.conversationId || '');
+      if (!convId) return;
+      // Skip stale log entries: the reactions log is append-only (un-reacting
+      // deletes msg.reactions[reactorId] but never the log row), so verify the
+      // reaction still exists on the message before showing the preview.
+      const reactedMsg = db.messages.find(m => m.id === r.messageId);
+      if (!reactedMsg || !reactedMsg.reactions || reactedMsg.reactions[r.reactorId] !== r.emoji) return;
+      const ts = new Date(r.timestamp).getTime();
+      const prev = convReactions[convId];
+      if (!prev) {
+        convReactions[convId] = { preview: `reacted ${r.emoji} to your message`, ts, count: 1 };
+      } else if (ts > prev.ts) {
+        // Newest reaction drives the preview emoji; keep accumulating count
+        // across ALL unseen reactions in this conversation.
+        prev.preview = `reacted ${r.emoji} to your message`;
+        prev.ts = ts;
+        prev.count++;
+      } else {
+        prev.count++;
+      }
+    });
+
+    // Global admin ids — stamps the gold crown on DM rows and group member lists.
+    const adminIdSet = new Set(db.users.filter(u => u.role === 'admin').map(u => String(u.id)));
+
     // Build DM conversations
     const dmConvs = Array.from(dmPartnerIds).map(pid => {
       const user = db.users.find(u => u.id === pid);
       if (!user) return null;
-      const { password, ...u } = user;
+      const { password, role, banned, bannedAt, ...u } = user;
+      const rx = convReactions[String(pid)];
+      const lastMsgTs = dmLastMsg[pid]?.timestamp || 0;
+      // A newer unseen reaction takes over the preview + last-activity time.
+      const reactionNewer = rx && rx.ts > lastMsgTs;
       return {
         type: 'dm',
         id: pid,
+        isAdmin: role === 'admin',
         name: u.displayName || u.username,
         username: u.username,
         avatar: u.avatar || null,
         online: u.online,
         lastSeen: u.lastSeen,
-        lastMessage: dmLastMsg[pid]?.text || '',
-        lastMessageTime: dmLastMsg[pid]?.timestamp || 0,
-        unread: dmUnread[pid] || 0,
+        lastMessage: reactionNewer ? rx.preview : (dmLastMsg[pid]?.text || ''),
+        lastMessageTime: reactionNewer ? rx.ts : lastMsgTs,
+        unread: (dmUnread[pid] || 0) + (rx ? rx.count : 0),
         blocked: blockedSet.has(pid),
         muted: mutedSet.has(pid)
       };
@@ -780,6 +894,9 @@ app.get('/api/conversations/:userId', async (req, res) => {
       .filter(g => g.members.includes(userId))
       .map(g => {
         const lm = groupLastMsg[g.id];
+        const rx = convReactions[String(g.id)];
+        const lastMsgTs = lm ? lm.timestamp : 0;
+        const reactionNewer = rx && rx.ts > lastMsgTs;
         return {
           type: 'group',
           id: g.id,
@@ -787,10 +904,12 @@ app.get('/api/conversations/:userId', async (req, res) => {
           avatar: g.avatar || null,
           members: g.members,
           admins: g.admins || [],
+          memberAdmins: g.members.filter(id => adminIdSet.has(String(id))),
           createdBy: g.createdBy,
-          lastMessage: lm ? lm.text : '',
-          lastMessageTime: lm ? lm.timestamp : 0,
-          unread: groupUnread[g.id] || 0,
+          countdown: g.countdown || null,
+          lastMessage: reactionNewer ? rx.preview : (lm ? lm.text : ''),
+          lastMessageTime: reactionNewer ? rx.ts : lastMsgTs,
+          unread: (groupUnread[g.id] || 0) + (rx ? rx.count : 0),
           muted: mutedSet.has(g.id)
         };
       });
@@ -799,6 +918,167 @@ app.get('/api/conversations/:userId', async (req, res) => {
     const allConvs = [...dmConvs, ...userGroups].sort((a, b) => b.lastMessageTime - a.lastMessageTime);
 
     res.json({ conversations: allConvs });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ============ FRIEND COMPATIBILITY ============
+// A fun "how compatible are you two" score computed from the real DM history
+// between the current user and a partner: message balance (who talks more),
+// emoji vocabulary overlap, reply-speed rhythm, and friendship longevity.
+// Read-only scan of that one thread — guarded by a light limiter like the
+// other read-heavy endpoints (search/poll/unread).
+const COMPAT_WINDOW_MS = 30 * 1000;
+const COMPAT_MAX = 20;
+
+app.get('/api/compatibility/:userId', (req, res) => {
+  try {
+    const limit = rateLimit(`compat:${req.userId}`, { windowMs: COMPAT_WINDOW_MS, max: COMPAT_MAX });
+    if (!limit.allowed) return sendTooMany(res, limit.retryAfterMs, 'Checking too fast — try again shortly.');
+
+    const db = loadDB();
+    const me = db.users.find(u => u.id === req.userId);
+    const them = db.users.find(u => u.id === req.params.userId);
+    if (!me || !them) return res.status(404).json({ error: 'User not found' });
+    if (String(them.id) === String(me.id)) return res.status(400).json({ error: 'Compare with a friend, not yourself' });
+
+    // DM messages only (never group messages), in either direction.
+    const thread = db.messages.filter(m => !m.groupId && !m.deleted &&
+      ((String(m.from) === String(me.id) && String(m.to) === String(them.id)) ||
+       (String(m.from) === String(them.id) && String(m.to) === String(me.id))));
+
+    const EMOJI_RE = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{2190}-\u{21FF}\u{2B50}\u{2764}\u{1F1E6}-\u{1F1FF}]/gu;
+
+    let youCount = 0, themCount = 0;
+    const youEmoji = {}, themEmoji = {};
+    const youGaps = [], themGaps = []; // reply gaps in minutes per direction
+    const days = new Set();
+    let prev = null;
+    const sorted = [...thread].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    for (const m of sorted) {
+      const ts = new Date(m.timestamp).getTime();
+      const fromMe = String(m.from) === String(me.id);
+      if (fromMe) youCount++; else themCount++;
+      days.add(new Date(ts).toDateString());
+      const emojis = (m.text || '').match(EMOJI_RE) || [];
+      const bucket = fromMe ? youEmoji : themEmoji;
+      emojis.forEach(e => { bucket[e] = (bucket[e] || 0) + 1; });
+      if (prev && prev.from !== String(m.from)) {
+        const gap = Math.round((ts - prev.ts) / 60000);
+        if (gap >= 0 && gap < 48 * 60) (fromMe ? youGaps : themGaps).push(gap);
+      }
+      prev = { from: String(m.from), ts };
+    }
+
+    const median = (arr) => {
+      if (!arr.length) return null;
+      const s = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(s.length / 2);
+      return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+    };
+    const youMedian = median(youGaps);
+    const themMedian = median(themGaps);
+
+    const total = youCount + themCount;
+
+    // No chat history yet — don't fake a "50/100 Good friends" score for a
+    // thread that has never had a single message. Return a clean "say hi"
+    // state (hasData:false) that the frontend renders as a friendly empty
+    // card instead of a misleading ring.
+    if (total === 0) {
+      const yourName0 = me.displayName || me.username;
+      const theirName0 = them.displayName || them.username;
+      return res.json({
+        score: 0, verdict: 'Say hi first', emoji: '👋', total: 0, hasData: false,
+        youCount: 0, themCount: 0, youSharePct: 0, emojiOverlapPct: 0,
+        sharedEmojis: [], yourTopEmojis: [], theirTopEmojis: [],
+        youMedian: null, themMedian: null,
+        replyLine: 'Send a few messages to unlock your compatibility score',
+        friendshipDays: 0, activeDays: 0,
+        yourName: yourName0, theirName: theirName0,
+        shareText: `✨ Friend Compatibility — ${yourName0} & ${theirName0}\nSay hi first 👋 — send a few messages to unlock your score`
+      });
+    }
+
+    const youShare = total ? youCount / total : 0.5;
+    const balance = 1 - Math.abs(youShare - 0.5) * 2; // 1 when perfectly 50/50
+
+    const youSet = new Set(Object.keys(youEmoji));
+    const themSet = new Set(Object.keys(themEmoji));
+    const shared = [...youSet].filter(e => themSet.has(e));
+    const union = new Set([...youSet, ...themSet]);
+    const emojiOverlap = union.size ? shared.length / union.size : 0;
+
+    let replyScore = 0.5; // neutral when neither side has rhythm data
+    if (youMedian != null && themMedian != null) {
+      const ratio = Math.min(youMedian, themMedian) / Math.max(youMedian, themMedian);
+      replyScore = 0.5 + 0.5 * ratio;
+    } else if (youMedian != null || themMedian != null) {
+      replyScore = 0.6;
+    }
+
+    const firstTs = sorted.length ? new Date(sorted[0].timestamp).getTime() : 0;
+    const lastTs = sorted.length ? new Date(sorted[sorted.length - 1].timestamp).getTime() : 0;
+    const friendshipDays = firstTs ? Math.max(1, Math.round((lastTs - firstTs) / 86400000)) : 0;
+    const longevity = Math.min(friendshipDays, 730) / 730; // saturates at ~2 years
+
+    const score = Math.round(100 * (0.4 * balance + 0.25 * emojiOverlap + 0.2 * replyScore + 0.15 * longevity));
+
+    let verdict, emoji;
+    if (score >= 85) { verdict = 'Soulmates'; emoji = '💞'; }
+    else if (score >= 70) { verdict = 'Besties'; emoji = '✨'; }
+    else if (score >= 55) { verdict = 'Great vibes'; emoji = '😄'; }
+    else if (score >= 40) { verdict = 'Good friends'; emoji = '🤝'; }
+    else if (score >= 20) { verdict = 'Getting to know each other'; emoji = '🌱'; }
+    else { verdict = 'Just acquaintances'; emoji = '👋'; }
+
+    let replyLine;
+    if (youMedian != null && themMedian != null) {
+      // Fast replies round to 0 minutes — dividing by a zero median would print
+      // "Infinity× faster", so use a minute as the floor for the ratio.
+      const youM = Math.max(youMedian, 1);
+      const themM = Math.max(themMedian, 1);
+      if (youMedian < themMedian) {
+        replyLine = `You reply ${(themM / youM).toFixed(1)}× faster than ${them.displayName || them.username}`;
+      } else if (themMedian < youMedian) {
+        replyLine = `${them.displayName || them.username} replies ${(youM / themM).toFixed(1)}× faster than you`;
+      } else {
+        replyLine = 'You reply at the same speed ⚡';
+      }
+    } else {
+      replyLine = 'Not enough messages to compare reply speed yet';
+    }
+
+    const topEmojis = (obj, n) => Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, n).map(([e]) => e);
+    const yourName = me.displayName || me.username;
+    const theirName = them.displayName || them.username;
+
+    const shareText =
+`✨ Friend Compatibility — ${yourName} & ${theirName}
+` +
+`${score}/100 · ${verdict} ${emoji}
+` +
+`💬 ${youCount} from you · ${themCount} from ${theirName}
+` +
+`🎭 ${Math.round(emojiOverlap * 100)}% same emojis
+` +
+`⚡ ${replyLine}
+` +
+`📅 Friends for ${friendshipDays} day${friendshipDays === 1 ? '' : 's'} · ${days.size} active day${days.size === 1 ? '' : 's'}`;
+
+    res.json({
+      score, verdict, emoji, total,
+      youCount, themCount, youSharePct: Math.round(youShare * 100),
+      emojiOverlapPct: Math.round(emojiOverlap * 100),
+      sharedEmojis: shared.slice(0, 6),
+      yourTopEmojis: topEmojis(youEmoji, 3),
+      theirTopEmojis: topEmojis(themEmoji, 3),
+      youMedian, themMedian, replyLine,
+      friendshipDays, activeDays: days.size,
+      yourName, theirName, shareText
+    });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -950,6 +1230,51 @@ app.put('/api/groups/:groupId/update', (req, res) => {
   }
 });
 
+// Set or update a group countdown (any member). Broadcasts to every online
+// member so the live banner updates without a refetch.
+app.post('/api/groups/:groupId/countdown', (req, res) => {
+  try {
+    const { label, target } = req.body;
+    const db = loadDB();
+    const group = db.groups.find(g => g.id === req.params.groupId);
+    const userId = req.userId;
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+    if (!(group.admins || []).includes(userId)) return res.status(403).json({ error: 'Only group admins can set a countdown' });
+    const targetMs = new Date(target).getTime();
+    if (!target || isNaN(targetMs)) return res.status(400).json({ error: 'A valid target date is required' });
+    if (targetMs <= Date.now()) return res.status(400).json({ error: 'Countdown time must be in the future' });
+    const countdown = {
+      label: (label || '').toString().slice(0, 60),
+      target: new Date(targetMs).toISOString(),
+      createdBy: userId,
+      createdAt: new Date().toISOString()
+    };
+    group.countdown = countdown;
+    saveDB(db);
+    notifyGroupMembers(group, 'group_updated', { groupId: group.id, countdown }, userId);
+    res.json({ success: true, countdown });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Remove a group countdown (any member).
+app.delete('/api/groups/:groupId/countdown', (req, res) => {
+  try {
+    const db = loadDB();
+    const group = db.groups.find(g => g.id === req.params.groupId);
+    const userId = req.userId;
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+    if (!(group.admins || []).includes(userId)) return res.status(403).json({ error: 'Only group admins can remove the countdown' });
+    delete group.countdown;
+    saveDB(db);
+    notifyGroupMembers(group, 'group_updated', { groupId: group.id, countdown: null }, userId);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ============ FEEDBACK HUB ROUTES ============
 
 // Ensure the feedback hub exists
@@ -1067,10 +1392,49 @@ app.get('/api/feedback/messages', (req, res) => {
     let messages = db.messages.filter(m => m.groupId === hubId);
     if (type) messages = messages.filter(m => m[`_${type}`]);
     messages.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-    const users = db.users.map(u => ({ id: u.id, username: u.username, displayName: u.displayName, avatar: u.avatar }));
+    const users = db.users.map(u => ({ id: u.id, username: u.username, displayName: u.displayName, avatar: u.avatar, isAdmin: u.role === 'admin' }));
     res.json({ messages, users });
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Unread "for me" thread replies for the requesting user. A reply is "for me"
+// when it @mentions me OR replies to a post I authored; it is unread until MY
+// id is in its readBy (per-user read state — Bob reading never clears mine).
+// Returns the total so the client can badge the Feedback Hub nav button (card
+// pills are computed client-side from loaded messages for instant sync). Uses
+// the verified session userId (never client-supplied identity).
+app.get('/api/feedback/unread', (req, res) => {
+  try {
+    // Read-only scan of all hub messages — light limiter matches the other
+    // read-heavy endpoints (poll/search) so a scripted client can't hammer it.
+    const limit = rateLimit(`feedbackUnread:${req.userId}`, { windowMs: UNREAD_WINDOW_MS, max: UNREAD_MAX });
+    if (!limit.allowed) return sendTooMany(res, limit.retryAfterMs, 'Checking too fast — try again shortly.');
+
+    const db = loadDB();
+    const hub = db.groups.find(g => g.id === FEEDBACK_HUB_ID);
+    if (!hub) return res.json({ count: 0 });
+
+    const myId = String(req.userId);
+    const parentById = {};
+    db.messages.forEach(m => { if (m.id) parentById[m.id] = m; });
+
+    let count = 0;
+    db.messages.forEach(m => {
+      if (m.groupId !== FEEDBACK_HUB_ID || !m._threadReply || m.deleted) return;
+      if (String(m.from) === myId) return;
+      const mentionedMe = Array.isArray(m.mentions) && m.mentions.some(id => String(id) === myId);
+      const parent = parentById[m.parentId];
+      const repliedToMyPost = parent && String(parent.from) === myId;
+      if (!mentionedMe && !repliedToMyPost) return;
+      if (Array.isArray(m.readBy) && m.readBy.some(id => String(id) === myId)) return;
+      count++;
+    });
+
+    res.json({ count });
+  } catch (e) {
+    res.json({ count: 0 });
   }
 });
 
@@ -1087,16 +1451,39 @@ app.get('/api/notifications/poll', (req, res) => {
     const db = loadDB();
     const sinceDate = since ? new Date(Number(since)) : new Date(Date.now() - 30000);
 
+    // Parent lookup so feedback-hub replies can be checked "for me" (I was
+    // @mentioned, or it replies to a post I authored) — the SAME rule the
+    // in-app Notifications drawer uses, so native + drawer stay consistent.
+    // A hub reply's parent is always a hub message itself, so index only the
+    // hub's messages (cheaper than mapping the whole DB on every 4s poll).
+    const hubParentById = {};
+    db.messages.forEach(m => {
+      if (m.id && String(m.groupId || '') === FEEDBACK_HUB_ID) hubParentById[m.id] = m;
+    });
+
     const unread = db.messages.filter(m => {
       if (m.deleted) return false;
-      if (m.read) return false;
+      // Per-user read state: someone else reading must never suppress THIS
+      // user's notification — only their own readBy entry does.
       if (m.readBy && Array.isArray(m.readBy) && m.readBy.includes(userId)) return false;
       if (String(m.from) === String(userId)) return false;
       if (new Date(m.timestamp) <= sinceDate) return false;
 
       if (m.groupId) {
         const group = db.groups.find(g => String(g.id) === String(m.groupId));
-        return group && group.members && group.members.some(memId => String(memId) === String(userId));
+        if (!group || !group.members || !group.members.some(memId => String(memId) === String(userId))) return false;
+        // The Feedback Hub is NOT a normal group chat. Only thread replies
+        // that are "for me" become native notifications; every other hub post
+        // stays in the hub's in-app drawer/badge instead of spamming the
+        // status bar with non-mentions and unrelated messages.
+        if (String(m.groupId) === FEEDBACK_HUB_ID) {
+          if (!m._threadReply) return false;
+          const mentionedMe = Array.isArray(m.mentions) && m.mentions.some(id => String(id) === String(userId));
+          if (mentionedMe) return true;
+          const parent = hubParentById[m.parentId];
+          return !!(parent && String(parent.from) === String(userId));
+        }
+        return true;
       } else {
         return String(m.to) === String(userId);
       }
@@ -1108,20 +1495,115 @@ app.get('/api/notifications/poll', (req, res) => {
       userMap[u.id] = u.displayName || u.username;
       avatarMap[u.id] = u.avatar || null;
     });
+    // Group context so the native notification can title itself "RR Test Group"
+    // instead of just "Bob" — Android has no other way to learn the group name.
+    const groupMap = {};
+    db.groups.forEach(g => { groupMap[g.id] = { name: g.name, avatar: g.avatar || null }; });
 
     const formatted = unread.slice(0, 5).map(m => ({
       id: m.id,
       from: m.from,
       groupId: m.groupId || null,
+      // Thread root id for feedback-hub replies so a notification tap can
+      // deep-link straight into the discussion thread (parentId is the root
+      // post; only thread replies are ever polled for the hub).
+      parentId: m.parentId || null,
+      // Root post text so Android can title each hub notification with the
+      // discussion thread it belongs to — separate threads = separate trays.
+      parentText: (m.parentId && hubParentById[m.parentId]) ? (hubParentById[m.parentId].text || null) : null,
+      groupName: m.groupId ? (groupMap[m.groupId] ? groupMap[m.groupId].name : null) : null,
+      groupAvatar: m.groupId ? (groupMap[m.groupId] ? groupMap[m.groupId].avatar : null) : null,
       senderName: userMap[m.from] || 'Someone',
       senderAvatar: avatarMap[m.from] || null,
       text: m.text || (m.type === 'image' ? '📷 Photo' : m.type === 'voice' ? '🎤 Voice' : 'New message'),
       timestamp: m.timestamp
     }));
 
-    res.json({ unread: formatted });
+    // Message ids this user has READ since the last poll (per-user readAt is
+    // recorded by mark_read). The Android background service uses these to
+    // prune/dismiss its tray notifications, so read mentions disappear from
+    // the status bar instead of lingering after the user reads them in-app.
+    // Capped to the most recent reads — the service only tracks a handful of
+    // shown messages per conversation.
+    // Reactions to the USER'S OWN messages (someone reacted to what I sent).
+    // Only the message author is targeted — the reactor is never notified.
+    // Mute is respected per conversation (dm partner id or group id).
+    // Reactions are GROUPED BY MESSAGE: multiple people reacting to the same
+    // message collapse into ONE entry (reactor count + names + newest emoji),
+    // so the client renders "Pawan and 2 others reacted 👍" instead of firing
+    // one alert per reactor. A group is delivered when ANY of its reactions is
+    // newer than sinceDate; capped at 5 groups like unread.
+    const myMuted = new Set((db.users.find(u => String(u.id) === String(userId)) || {}).mutedConversations || []);
+    const reactions = (() => {
+      // messageId -> group accumulator
+      const groups = new Map();
+      (db.reactions || [])
+        .filter(r => String(r.targetUserId) === String(userId))
+        .filter(r => !myMuted.has(String(r.conversationId)))
+        .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+        .forEach(r => {
+          // Skip stale log entries (un-reacted): the reactions log is
+          // append-only, so verify the reaction still exists on the message.
+          const reacted = db.messages.find(m => m.id === r.messageId);
+          if (!reacted || !reacted.reactions || reacted.reactions[r.reactorId] !== r.emoji) return;
+          let g = groups.get(r.messageId);
+          if (!g) {
+            g = { messageId: r.messageId, reactors: new Map(), newestTs: 0 };
+            groups.set(r.messageId, g);
+          }
+          // One row per reactor (a reactor changing emoji stays one reactor);
+          // keep the newest reaction's emoji + timestamp for the group.
+          const prev = g.reactors.get(r.reactorId);
+          if (!prev) {
+            g.reactors.set(r.reactorId, { id: r.reactorId, name: userMap[r.reactorId] || 'Someone', avatar: avatarMap[r.reactorId] || null, emoji: r.emoji, ts: new Date(r.timestamp).getTime() });
+          } else if (new Date(r.timestamp).getTime() > prev.ts) {
+            prev.emoji = r.emoji;
+            prev.ts = new Date(r.timestamp).getTime();
+          }
+          const ts = new Date(r.timestamp).getTime();
+          if (ts > g.newestTs) g.newestTs = ts;
+        });
+      // Build group entries, newest-first, only groups with fresh activity.
+      return Array.from(groups.values())
+        .filter(g => g.newestTs > sinceDate.getTime())
+        .sort((a, b) => b.newestTs - a.newestTs)
+        .slice(0, 5)
+        .map(g => {
+          const newest = Array.from(g.reactors.values()).sort((a, b) => b.ts - a.ts)[0];
+          const names = Array.from(g.reactors.values()).sort((a, b) => b.ts - a.ts).map(x => x.name);
+          const reacted = db.messages.find(m => m.id === g.messageId);
+          return {
+            // Stable id across polls so the client can dedupe the GROUP (not
+            // per reaction): messageId + reactor count.
+            id: `${g.messageId}:${g.reactors.size}`,
+            messageId: g.messageId,
+            reactorId: g.reactors.size === 1 ? newest.id : null,
+            reactorName: newest ? newest.name : 'Someone',
+            reactorNames: names,
+            reactorCount: g.reactors.size,
+            emoji: newest ? newest.emoji : '👍',
+            reactorAvatar: newest ? newest.avatar : null,
+            // If the reacted message was deleted afterward, don't surface the
+            // original text in the notification — just say it was a message.
+            text: reacted ? (reacted.deleted ? 'a deleted message'
+              : (reacted.text || (reacted.type === 'image' ? '📷 Photo' : reacted.type === 'voice' ? '🎤 Voice' : 'New message'))) : 'New message',
+            groupId: reacted ? (reacted.groupId || null) : null,
+            dmPartnerId: reacted ? (reacted.groupId ? null : (reacted.to || null)) : null,
+            groupName: (reacted && reacted.groupId && groupMap[reacted.groupId]) ? groupMap[reacted.groupId].name : null,
+            conversationId: reacted ? String(reacted.groupId || reacted.to || '') : '',
+            timestamp: new Date(g.newestTs).toISOString()
+          };
+        });
+    })();
+
+    const readIds = db.messages
+      .filter(m => m.readAt && m.readAt[userId] && new Date(m.readAt[userId]) > sinceDate)
+      .map(m => String(m.id))
+      .slice(-200);
+
+    res.json({ unread: formatted, readIds, reactions });
   } catch (e) {
-    res.json({ unread: [] });
+    res.json({ unread: [], reactions: [] });
   }
 });
 
@@ -1137,6 +1619,25 @@ app.post('/api/messages/reply', (req, res) => {
     if (!from || (!to && !groupId) || !text) return res.status(400).json({ error: 'Missing required parameters' });
 
     const db = loadDB();
+
+    // Access control — must mirror the socket path exactly (this is the
+    // Android inline-reply endpoint, so it must not be a bypass):
+    //   * group: sender must be a member of the group;
+    //   * DM: recipient must exist, and neither party may have blocked the
+    //     other (silently drop like the socket path, or 403).
+    if (groupId) {
+      const group = db.groups.find(g => String(g.id) === String(groupId));
+      if (!group || !group.members.some(m => String(m) === String(from))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    } else if (to) {
+      // Shared authorization — same rule as the socket send_message handler.
+      const sendCheck = checkDMSend(db, from, to);
+      if (!sendCheck.ok) {
+        return res.status(sendCheck.status).json({ error: sendCheck.error });
+      }
+    }
+
     const message = {
       id: uuidv4(),
       from,
@@ -1147,7 +1648,9 @@ app.post('/api/messages/reply', (req, res) => {
       replyTo: replyTo || null,
       timestamp: new Date().toISOString(),
       read: false,
-      readBy: [from]
+      // Read receipts track who else has read a message; the author is not a
+      // reader, so HTTP-replied messages start empty (consistent with socket sends).
+      readBy: []
     };
 
     db.messages.push(message);
@@ -1292,16 +1795,115 @@ app.post('/api/messages/:id/report', (req, res) => {
 // ---- ADMIN: all routes below require the global admin role ----
 
 // List every user with moderation metadata (never the password).
+// Media types that count as "shared media" for bot detection.
+const MEDIA_TYPES = ['image', 'video', 'voice', 'file', 'document'];
+
+// Shared heuristic for the admin Bot Check. Returns 0-100 plus the signals it
+// derived — evidence to help an admin judge, NEVER an automated verdict (a
+// legit power-user can look bot-like). Kept in one place so the users list and
+// the per-user detail page always agree.
+function botSignalsFor(user, sentMsgs) {
+  const created = new Date(user.createdAt || Date.now()).getTime();
+  const ageDays = Math.max((Date.now() - created) / 86400000, 0.001);
+  const msgsPerDay = sentMsgs.length / ageDays;
+  const mediaCount = sentMsgs.filter(m => m.mediaUrl && MEDIA_TYPES.includes(m.type)).length;
+  let score = 0;
+  // Rate-based signals only apply once there is real volume — a brand-new
+  // user who sends their first few messages must NEVER look like a bot
+  // (1 message in an 86-second-old account = ~1000/day without this gate).
+  if (sentMsgs.length >= 10) {
+    if (msgsPerDay > 120) score += 40;
+    else if (msgsPerDay > 60) score += 30;
+    else if (msgsPerDay > 25) score += 15;
+    // Text-only flood (no media ever but many messages).
+    if (mediaCount === 0 && sentMsgs.length > 50) score += 10;
+    // Media flood (mostly media, lots of it).
+    if (sentMsgs.length > 20 && mediaCount / sentMsgs.length > 0.8) score += 10;
+    // Brand-new account already very active (only with substantial volume).
+    if (sentMsgs.length > 20 && ageDays < 1) score += 15;
+  }
+  return {
+    score: Math.min(100, score),
+    ageDays: +ageDays.toFixed(1),
+    msgsPerDay: +msgsPerDay.toFixed(2),
+    mediaCount
+  };
+}
+
 app.get('/api/admin/users', requireAdmin, (req, res) => {
   try {
     const db = loadDB();
     const users = db.users.map(u => {
       const { password, ...safe } = u;
-      safe.messageCount = db.messages.filter(m => m.from === u.id && !m.deleted).length;
+      const sentMsgs = db.messages.filter(m => m.from === u.id && !m.deleted);
+      safe.messageCount = sentMsgs.length;
       safe.reportCount = (db.reports || []).filter(r => r.messageId && db.messages.some(m => m.id === r.messageId && m.from === u.id)).length;
+      const bot = botSignalsFor(u, sentMsgs);
+      safe.mediaCount = bot.mediaCount;
+      safe.botScore = bot.score;
       return safe;
     }).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     res.json({ users });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Admin: Bot Check — media + behavioral signals for one user. Everything here
+// is data the app already legitimately stores (media the user SENT through the
+// app, message timestamps, account age) — no device/file access is involved.
+app.get('/api/admin/users/:id/media', requireAdmin, (req, res) => {
+  try {
+    const db = loadDB();
+    const user = db.users.find(u => u.id === req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Every non-deleted message the user sent, newest first.
+    const sent = db.messages
+      .filter(m => String(m.from) === String(user.id) && !m.deleted)
+      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+    // Media the user actually shared through the app (photo/video/voice/file).
+    const media = sent
+      .filter(m => m.mediaUrl && MEDIA_TYPES.includes(m.type))
+      .map(m => ({
+        id: m.id,
+        type: m.type,
+        mediaUrl: m.mediaUrl,
+        text: m.text || null,
+        groupId: m.groupId || null,
+        timestamp: m.timestamp
+      }));
+
+    const bot = botSignalsFor(user, sent);
+    const partners = new Set(sent.filter(m => !m.groupId).map(m => String(m.from) === String(user.id) ? m.to : m.from));
+    const groups = new Set(sent.filter(m => m.groupId).map(m => m.groupId));
+    const risk = bot.score >= 50 ? 'high' : bot.score >= 25 ? 'medium' : 'low';
+
+    res.json({
+      user: {
+        id: user.id,
+        username: user.username,
+        displayName: user.displayName,
+        avatar: user.avatar,
+        role: user.role,
+        banned: !!user.banned,
+        createdAt: user.createdAt
+      },
+      signals: {
+        accountAgeDays: bot.ageDays,
+        totalMessages: sent.length,
+        mediaCount: bot.mediaCount,
+        msgsPerDay: bot.msgsPerDay,
+        uniquePartners: partners.size,
+        uniqueGroups: groups.size,
+        firstMessageAt: sent.length ? sent[sent.length - 1].timestamp : null,
+        lastMessageAt: sent.length ? sent[0].timestamp : null
+      },
+      botScore: bot.score,
+      risk,
+      media
+    });
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -1547,6 +2149,40 @@ app.post('/api/admin/appeals/:id/reject', requireAdmin, (req, res) => {
 // ============ SOCKET.IO ============
 const onlineUsers = new Map(); // userId -> socketId
 
+// P2P signaling queue: if the intended recipient isn't registered online at the
+// exact instant a signal arrives (socket race, brief reconnect, app just
+// opened), the signal used to be dropped — forcing users to reload until a
+// transfer finally connected. Now we park signals here and flush them to the
+// recipient's socket on user_online. Entries expire so stale offers never linger.
+const pendingP2P = new Map(); // userId -> [{ event, payload, ts }]
+const P2P_SIGNAL_TTL = 120000; // 2 minutes
+
+function queueP2P(userId, event, payload) {
+  if (!pendingP2P.has(userId)) pendingP2P.set(userId, []);
+  const arr = pendingP2P.get(userId);
+  arr.push({ event, payload, ts: Date.now() });
+  while (arr.length > 200) arr.shift(); // hard cap per user
+}
+
+function flushP2P(userId, socket) {
+  const arr = pendingP2P.get(userId);
+  if (!arr || !arr.length) return;
+  pendingP2P.delete(userId);
+  const now = Date.now();
+  for (const p of arr) {
+    if (now - p.ts > P2P_SIGNAL_TTL) continue; // expired
+    socket.emit(p.event, p.payload);
+  }
+}
+
+// Deliver an event to a user's live socket, or park it for delivery the moment
+// they register online. Never silently drops a P2P signal.
+function relayOrQueueP2P(userId, event, payload) {
+  const s = onlineUsers.get(userId);
+  if (s) io.to(s).emit(event, payload);
+  else queueP2P(userId, event, payload);
+}
+
 // Authenticate every socket connection with the same opaque session token
 // used for HTTP. The verified user id is attached as socket.userId and is the
 // ONLY trusted identity for all subsequent events (client-supplied ids are
@@ -1587,6 +2223,9 @@ io.on('connection', (socket) => {
 
     // Send online users list
     socket.emit('online_users', Array.from(onlineUsers.keys()));
+
+    // Deliver any P2P signals parked while this user was offline/reconnecting.
+    flushP2P(userId, socket);
   });
 
   // Avatar (DP) update
@@ -1614,15 +2253,11 @@ io.on('connection', (socket) => {
     const from = socket.userId;
     const db = loadDB();
 
-    // Check if sender is blocked by the recipient
-    const recipient = db.users.find(u => u.id === to);
-    if (recipient && (recipient.blockedUsers || []).includes(from)) {
-      return socket.emit('message_blocked', { to, error: 'You are blocked by this user' });
-    }
-    // Check if recipient is blocked by the sender
-    const sender = db.users.find(u => u.id === from);
-    if (sender && (sender.blockedUsers || []).includes(to)) {
-      return socket.emit('message_blocked', { to, error: 'You have blocked this user. Unblock to send messages.' });
+    // Shared authorization — recipient must exist and neither party may have
+    // blocked the other (identical rule to the HTTP inline-reply endpoint).
+    const sendCheck = checkDMSend(db, from, to);
+    if (!sendCheck.ok) {
+      return socket.emit('message_blocked', { to, error: sendCheck.error });
     }
 
     const message = {
@@ -1664,7 +2299,10 @@ io.on('connection', (socket) => {
     const db = loadDB();
 
     const group = db.groups.find(g => g.id === groupId);
-    if (!group) return;
+    // Membership check: a user must be a member of the group to post into it.
+    // Without this, any authenticated user could inject messages into any
+    // group whose id they know (IDOR / broken access control).
+    if (!group || !group.members.includes(from)) return;
 
     const message = {
       id: uuidv4(),
@@ -1704,19 +2342,25 @@ io.on('connection', (socket) => {
   socket.on('typing', (data) => {
     const { to, groupId } = data;
     const from = socket.userId;
+    // Send the display name so recipients can show "Alice is typing…" without
+    // waiting for a name-cache prefetch.
+    const sender = loadDB().users.find(u => u.id === from);
+    const name = sender ? (sender.displayName || sender.username) : null;
     if (groupId) {
       const group = loadDB().groups.find(g => g.id === groupId);
-      if (group) {
+      // Only members may broadcast typing state in a group (no spoofing into
+      // groups you're not part of).
+      if (group && group.members.includes(from)) {
         group.members.forEach(memberId => {
           if (memberId === from) return;
           const ms = onlineUsers.get(memberId);
-          if (ms) io.to(ms).emit('user_typing', { from, groupId });
+          if (ms) io.to(ms).emit('user_typing', { from, groupId, name });
         });
       }
     } else {
       const recipientSocket = onlineUsers.get(to);
       if (recipientSocket) {
-        io.to(recipientSocket).emit('user_typing', { from });
+        io.to(recipientSocket).emit('user_typing', { from, name });
       }
     }
   });
@@ -1724,19 +2368,21 @@ io.on('connection', (socket) => {
   socket.on('stop_typing', (data) => {
     const { to, groupId } = data;
     const from = socket.userId;
+    const sender = loadDB().users.find(u => u.id === from);
+    const name = sender ? (sender.displayName || sender.username) : null;
     if (groupId) {
       const group = loadDB().groups.find(g => g.id === groupId);
-      if (group) {
+      if (group && group.members.includes(from)) {
         group.members.forEach(memberId => {
           if (memberId === from) return;
           const ms = onlineUsers.get(memberId);
-          if (ms) io.to(ms).emit('user_stop_typing', { from, groupId });
+          if (ms) io.to(ms).emit('user_stop_typing', { from, groupId, name });
         });
       }
     } else {
       const recipientSocket = onlineUsers.get(to);
       if (recipientSocket) {
-        io.to(recipientSocket).emit('user_stop_typing', { from });
+        io.to(recipientSocket).emit('user_stop_typing', { from, name });
       }
     }
   });
@@ -1749,21 +2395,81 @@ io.on('connection', (socket) => {
     const processed = [];
     messageIds.forEach(id => {
       const msg = db.messages.find(m => m.id === id);
-      // Only allow marking messages in conversations the user is party to.
-      if (msg && isUserPartyToMessage(msg, userId)) {
+      // Only allow marking messages in conversations the user is party to,
+      // and never the user's own messages (authors can't "read" their own
+      // text — a crafted socket event must not self-pollute readBy, which
+      // would show the author in their own Seen By card).
+      if (msg && isUserPartyToMessage(msg, userId) && String(msg.from) !== String(userId)) {
         msg.read = true;
         if (!msg.readBy) msg.readBy = [];
         if (userId && !msg.readBy.includes(userId)) {
           msg.readBy.push(userId);
+          // First-read time per reader — powers the Chat Info "Seen by" list
+          // (name + when). Only set on the first read so it is never bumped.
+          if (!msg.readAt) msg.readAt = {};
+          msg.readAt[userId] = new Date().toISOString();
         }
         processed.push(id);
       }
     });
     saveDB(db);
-    // Only broadcast the ids that were actually updated.
+    // Only broadcast the ids that were actually updated, and only to sockets
+    // party to those conversations (a DM read receipt must never leak to an
+    // unrelated user). Include the reader's display name so the recipient can
+    // render the avatar immediately without an extra fetch.
     if (processed.length > 0) {
-      io.emit('messages_read', { messageIds: processed, userId });
+      const partyIds = new Set();
+      processed.forEach(id => {
+        const m = db.messages.find(x => x.id === id);
+        if (!m) return;
+        if (m.groupId) {
+          const g = db.groups.find(x => x.id === m.groupId);
+          if (g) g.members.forEach(mid => partyIds.add(mid));
+        } else {
+          partyIds.add(m.from);
+          partyIds.add(m.to);
+        }
+      });
+      const reader = db.users.find(u => u.id === userId);
+      // Per-message first-read timestamps so recipients can render "Seen by"
+      // times live (initial loads get them straight from the HTTP response).
+      const readAt = {};
+      processed.forEach(id => {
+        const m = db.messages.find(x => x.id === id);
+        readAt[id] = (m && m.readAt) ? (m.readAt[userId] || null) : null;
+      });
+      const payload = {
+        messageIds: processed,
+        userId,
+        displayName: reader ? (reader.displayName || reader.username) : null,
+        readAt
+      };
+      partyIds.forEach(pid => {
+        const sid = onlineUsers.get(pid);
+        if (sid) io.to(sid).emit('messages_read', payload);
+      });
     }
+  });
+
+  // Mark ALL reactions targeting the caller as seen in a conversation. Called
+  // when the user opens a chat — clears the "reacted to your message" unread
+  // preview in the chat list. Only reactions where the caller is the target
+  // (author of the reacted message) are touched; the reactor's own view is
+  // never affected.
+  socket.on('mark_reactions_read', (data) => {
+    const { conversationId } = data;
+    const userId = socket.userId;
+    if (!userId || !conversationId) return;
+    const db = loadDB();
+    const now = new Date().toISOString();
+    let changed = false;
+    (db.reactions || []).forEach(r => {
+      if (String(r.targetUserId) !== String(userId)) return;
+      if (String(r.conversationId) !== String(conversationId)) return;
+      if (!r.readAt || typeof r.readAt !== 'object') r.readAt = {};
+      if (!r.readAt[userId]) { r.readAt[userId] = now; changed = true; }
+    });
+    if (changed) saveDB(db);
   });
 
   // Edit message — only the author may edit
@@ -1789,11 +2495,56 @@ io.on('connection', (socket) => {
     const db = loadDB();
     const msg = db.messages.find(m => m.id === messageId);
     if (msg && isUserPartyToMessage(msg, userId)) {
+      const removing = msg.reactions && msg.reactions[userId] === emoji;
       if (!msg.reactions) msg.reactions = {};
-      if (msg.reactions[userId] === emoji) delete msg.reactions[userId];
+      if (removing) delete msg.reactions[userId];
       else msg.reactions[userId] = emoji;
+      // Log the reaction so the message AUTHOR gets a native notification
+      // (WhatsApp-style "X reacted 👍 to \"...\""). Only on ADD, never on
+      // remove, and never notify the reactor themself.
+      if (!removing && String(msg.from) !== String(userId)) {
+        if (!Array.isArray(db.reactions)) db.reactions = [];
+        db.reactions.push({
+          id: uuidv4(),
+          messageId,
+          reactorId: userId,
+          emoji,
+          timestamp: new Date().toISOString(),
+          targetUserId: msg.from,              // the author — the only notified party
+          groupId: msg.groupId || null,
+          dmPartnerId: msg.groupId ? null : userId, // DM tap → open that chat
+          conversationId: msg.groupId ? String(msg.groupId) : String(userId),
+          // Per-user "seen" map: readAt[targetUserId] is set when the author
+          // opens that conversation (mark_reactions_read) — until then the
+          // reaction counts as an unread "reacted to your message" in the
+          // chat list.
+          readAt: {}
+        });
+        // Bounded: reactions are a transient notification log, not history.
+        if (db.reactions.length > 2000) db.reactions = db.reactions.slice(-1500);
+      }
       saveDB(db);
-      io.emit('message_reacted', { messageId, reactions: msg.reactions });
+      // Rich payload so the web client can show a WhatsApp-style toast
+      // ("X reacted 🧐 to your message") when someone reacts to MY message
+      // while I'm not looking at that chat: authorId (whose message), the
+      // conversation ids, plus who reacted + what emoji.
+      const reactor = db.users.find(u => String(u.id) === String(userId));
+      const reactedGroup = msg.groupId ? db.groups.find(g => String(g.id) === String(msg.groupId)) : null;
+      io.emit('message_reacted', {
+        messageId,
+        reactions: msg.reactions,
+        authorId: msg.from,
+        groupId: msg.groupId || null,
+        groupName: reactedGroup ? reactedGroup.name : null,
+        dmPartnerId: msg.groupId ? null : userId,
+        reactorId: userId,
+        reactorName: reactor ? (reactor.displayName || reactor.username || 'Someone') : 'Someone',
+        emoji,
+        // True when a reaction was ADDED, false when it was toggled OFF — lets
+        // clients bump the chat-list unread preview only on real adds (the
+        // emit fires for both, and a removal must never count as new activity).
+        added: !removing
+      });
     }
   });
 
@@ -1812,7 +2563,7 @@ io.on('connection', (socket) => {
   // ===== WEBRTC DIRECT P2P FILE SIGNALING =====
   socket.on('p2p_signal', (data) => {
     const { to, signal, transferId, fileMeta } = data;
-    if (!to) return;
+    if (!to || !signal) return;
     const recipientSocket = onlineUsers.get(to);
     if (recipientSocket) {
       io.to(recipientSocket).emit('p2p_signal', {
@@ -1822,23 +2573,35 @@ io.on('connection', (socket) => {
         fileMeta
       });
     } else {
-      socket.emit('p2p_error', { transferId, error: 'Recipient is offline for P2P transfer' });
+      // Recipient isn't registered this exact instant — park the signal and
+      // deliver it when they come online instead of dropping it.
+      queueP2P(to, 'p2p_signal', { from: socket.userId, signal, transferId, fileMeta });
+      if (signal.type === 'offer') {
+        // Tell the sender the offer is parked, not lost.
+        socket.emit('p2p_queued', { transferId });
+      }
     }
+  });
+
+  // A receiver who lost the offer (reload / reconnect) asks the sender to
+  // re-send it. Relayed to the sender's live socket, or queued if offline.
+  socket.on('p2p_request_offer', (data) => {
+    const { to, transferId } = data;
+    if (!to) return;
+    relayOrQueueP2P(to, 'p2p_request_offer', { from: socket.userId, transferId });
   });
 
   socket.on('p2p_complete', (data) => {
     const { to, transferId } = data;
     const db = loadDB();
     const msg = db.messages.find(m => m.p2pId === transferId || (m.p2pMeta && m.p2pMeta.p2pId === transferId));
-    if (msg) {
+    // Only a party to the transfer's message may change its status.
+    if (msg && isUserPartyToMessage(msg, socket.userId)) {
       msg.p2pStatus = 'completed';
       saveDB(db);
     }
     if (to) {
-      const recipientSocket = onlineUsers.get(to);
-      if (recipientSocket) {
-        io.to(recipientSocket).emit('p2p_complete', { from: socket.userId, transferId });
-      }
+      relayOrQueueP2P(to, 'p2p_complete', { from: socket.userId, transferId });
     }
   });
 
@@ -1846,15 +2609,12 @@ io.on('connection', (socket) => {
     const { to, transferId } = data;
     const db = loadDB();
     const msg = db.messages.find(m => m.p2pId === transferId || (m.p2pMeta && m.p2pMeta.p2pId === transferId));
-    if (msg) {
+    if (msg && isUserPartyToMessage(msg, socket.userId)) {
       msg.p2pStatus = 'declined';
       saveDB(db);
     }
     if (to) {
-      const recipientSocket = onlineUsers.get(to);
-      if (recipientSocket) {
-        io.to(recipientSocket).emit('p2p_cancel', { from: socket.userId, transferId });
-      }
+      relayOrQueueP2P(to, 'p2p_cancel', { from: socket.userId, transferId });
     }
   });
 
@@ -1862,15 +2622,12 @@ io.on('connection', (socket) => {
     const { to, transferId } = data;
     const db = loadDB();
     const msg = db.messages.find(m => m.p2pId === transferId || (m.p2pMeta && m.p2pMeta.p2pId === transferId));
-    if (msg) {
+    if (msg && isUserPartyToMessage(msg, socket.userId)) {
       msg.p2pStatus = 'failed';
       saveDB(db);
     }
     if (to) {
-      const recipientSocket = onlineUsers.get(to);
-      if (recipientSocket) {
-        io.to(recipientSocket).emit('p2p_failed', { from: socket.userId, transferId });
-      }
+      relayOrQueueP2P(to, 'p2p_failed', { from: socket.userId, transferId });
     }
   });
 
@@ -1882,7 +2639,7 @@ io.on('connection', (socket) => {
       (transferId && (m.p2pId === transferId || (m.p2pMeta && m.p2pMeta.p2pId === transferId))) ||
       (msgId && m.id === msgId)
     );
-    if (msg) {
+    if (msg && isUserPartyToMessage(msg, socket.userId)) {
       msg.p2pStatus = status;
       saveDB(db);
     }
@@ -1899,6 +2656,10 @@ io.on('connection', (socket) => {
     if (!hub) return;
     if (msg.from !== userId && !hub.admins.includes(userId)) return;
     msg.deleted = true;
+    // Cascade: deleting a thread root must also hide every reply under it, or
+    // the deleted thread's replies would keep showing in the admin Feedback
+    // Hub (and in the app's thread list) as orphaned posts.
+    db.messages.forEach(m => { if (m.parentId === msg.id) m.deleted = true; });
     saveDB(db);
     io.emit('message_deleted', { messageId });
   });
@@ -2055,16 +2816,25 @@ io.on('connection', (socket) => {
     io.emit('poll_votes_updated', { messageId, votes: msg._poll.votes });
   });
 
-  // Thread reply (for bug/feature discussions)
+  // Thread reply (for bug/feature discussions). Supports @mentions: the client
+  // sends a `mentions` array of user ids; we validate them against real users
+  // (never self), persist them, and ping the mentioned users if they're online.
   socket.on('thread_reply', (data) => {
     const from = socket.userId;
-    const { parentId, text, mediaUrl } = data;
+    const { parentId, text, mediaUrl, mentions } = data;
     if (!text || !text.trim()) return socket.emit('feedback_error', { error: 'Reply text is required' });
     if (!checkFeedbackRateLimit(from)) return socket.emit('feedback_error', { error: 'You are replying too fast. Please wait.' });
 
     const db = loadDB();
     const parent = db.messages.find(m => m.id === parentId);
     if (!parent || parent.groupId !== FEEDBACK_HUB_ID) return;
+
+    // Only trust mentions of real users, never self-mentions, dedupe.
+    const mentionIds = (Array.isArray(mentions) ? mentions : [])
+      .map(id => String(id))
+      .filter(id => id && id !== String(from))
+      .filter(id => db.users.some(u => String(u.id) === id));
+    const uniqueMentions = [...new Set(mentionIds)];
 
     const reply = {
       id: uuidv4(),
@@ -2081,13 +2851,34 @@ io.on('connection', (socket) => {
       deleted: false,
       timestamp: new Date().toISOString(),
       read: false,
-      _threadReply: true
+      _threadReply: true,
+      mentions: uniqueMentions
     };
 
     db.messages.push(reply);
     saveDB(db);
     io.emit('new_group_message', reply);
     socket.emit('feedback_success', { type: 'thread_reply', messageId: reply.id, parentId });
+
+    // Notify mentioned users who are online right now.
+    if (uniqueMentions.length) {
+      const author = db.users.find(u => String(u.id) === String(from));
+      const fromName = author ? (author.displayName || author.username || 'Someone') : 'Someone';
+      const parentText = parent.text ? String(parent.text).slice(0, 60) : '';
+      uniqueMentions.forEach(uid => {
+        const sockId = onlineUsers.get(uid);
+        if (sockId) {
+          io.to(sockId).emit('feedback_mention', {
+            to: uid,
+            from: String(from),
+            fromName,
+            parentId,
+            replyId: reply.id,
+            parentText
+          });
+        }
+      });
+    }
   });
 
   // Disconnect
@@ -2107,6 +2898,44 @@ io.on('connection', (socket) => {
     }
     console.log('Socket disconnected:', socket.id);
   });
+});
+
+// ============ IN-APP UPDATE MANIFEST ============
+// The public "what's new" catalog that clients poll to discover web/APK
+// updates. GET is public (checked before login on first launch); POST is
+// admin-only and is what release.js calls to publish a new build. The file
+// lives next to db.json (DATA_DIR) so it persists across redeploys exactly
+// like the database.
+const UPDATE_MANIFEST_PATH = process.env.UPDATE_MANIFEST_PATH || path.join(DATA_DIR, 'update-manifest.json');
+
+function readUpdateManifest() {
+  try {
+    if (!fs.existsSync(UPDATE_MANIFEST_PATH)) return null;
+    return JSON.parse(fs.readFileSync(UPDATE_MANIFEST_PATH, 'utf-8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+// Public: any client can ask "is there an update?" without a session.
+app.get('/api/update/manifest', (req, res) => {
+  const manifest = readUpdateManifest();
+  if (!manifest) return res.status(404).json({ error: 'No update published yet' });
+  res.json(manifest);
+});
+
+// Publish (admin only). Body is the full manifest object produced by release.js.
+app.post('/api/update/manifest', requireAdmin, (req, res) => {
+  try {
+    const manifest = req.body;
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+      return res.status(400).json({ error: 'Manifest object required' });
+    }
+    fs.writeFileSync(UPDATE_MANIFEST_PATH, JSON.stringify(manifest, null, 2));
+    res.json({ success: true, manifest });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to save manifest' });
+  }
 });
 
 ensureFeedbackHub();
