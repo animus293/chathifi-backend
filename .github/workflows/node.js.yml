@@ -1,0 +1,17 @@
+name: Run JavaScript Script
+on: [push] # Triggers the script on every push
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies (optional)
+        run: npm install # Remove if your script doesn't need external packages
+      - name: Run script
+        run: node index.js
+        
